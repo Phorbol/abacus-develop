@@ -1,6 +1,10 @@
 #ifndef DRIVER_H
 #define DRIVER_H
 
+#include <iosfwd>
+
+class Parameter;
+
 
 class Driver
 {
@@ -36,7 +40,7 @@ class Driver
 
     // the actual calculations
     void driver_run();
-    void driver_ipi_run();
+    void driver_ipi_run(const Parameter& param, int my_rank, std::ofstream& running_log);
 
     // Init harewares according to Input parameters
     void init_hardware();

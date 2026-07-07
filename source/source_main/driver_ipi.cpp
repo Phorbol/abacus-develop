@@ -6,7 +6,6 @@
 #include "source_cell/check_atomic_stru.h"
 #include "source_cell/update_cell.h"
 #include "source_esolver/esolver.h"
-#include "source_base/global_variable.h"
 #include "source_io/module_json/para_json.h"
 #include "source_io/module_output/print_info.h"
 #include "source_io/module_parameter/parameter.h"
@@ -19,6 +18,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <memory>
+#include <fstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -28,9 +28,9 @@ namespace
 constexpr double RY_TO_HARTREE = 0.5;
 constexpr int IPI_RANK_ROOT = 0;
 
-bool is_root()
+bool is_root(const int my_rank)
 {
-    return GlobalV::MY_RANK == IPI_RANK_ROOT;
+    return my_rank == IPI_RANK_ROOT;
 }
 
 void bcast_int(int& value)
@@ -51,7 +51,7 @@ void bcast_double_vector(std::vector<double>& values)
 #endif
 }
 
-std::string bcast_string(std::string value)
+std::string bcast_string(std::string value, const int my_rank)
 {
     int nbytes = static_cast<int>(value.size());
     bcast_int(nbytes);
@@ -59,7 +59,7 @@ std::string bcast_string(std::string value)
     {
         throw std::runtime_error("negative string length in i-PI broadcast");
     }
-    if (!is_root())
+    if (!is_root(my_rank))
     {
         value.assign(static_cast<std::size_t>(nbytes), '\0');
     }
@@ -72,20 +72,20 @@ std::string bcast_string(std::string value)
     return value;
 }
 
-void throw_if_root_io_failed(int root_failed, const std::string& root_message)
+void throw_if_root_io_failed(int root_failed, const std::string& root_message, const int my_rank)
 {
     bcast_int(root_failed);
-    const std::string message = bcast_string(root_message);
+    const std::string message = bcast_string(root_message, my_rank);
     if (root_failed != 0)
     {
         throw std::runtime_error(message.empty() ? "i-PI socket I/O failed" : message);
     }
 }
 
-std::string bcast_header(const std::string& root_header)
+std::string bcast_header(const std::string& root_header, const int my_rank)
 {
     char buffer[13] = {' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', '\0'};
-    if (is_root())
+    if (is_root(my_rank))
     {
         const std::size_t n = root_header.size() > 12 ? 12 : root_header.size();
         for (std::size_t i = 0; i < n; ++i)
@@ -205,40 +205,21 @@ std::vector<double> flatten_forces_hartree_per_bohr(const ModuleBase::matrix& fo
     return out;
 }
 
-class CalculationModeGuard
-{
-  public:
-    explicit CalculationModeGuard(const std::string& inner_calculation)
-        : outer_calculation_(PARAM.inp.calculation)
-    {
-        const_cast<std::string&>(PARAM.inp.calculation) = inner_calculation;
-    }
-
-    ~CalculationModeGuard()
-    {
-        const_cast<std::string&>(PARAM.inp.calculation) = outer_calculation_;
-    }
-
-    CalculationModeGuard(const CalculationModeGuard&) = delete;
-    CalculationModeGuard& operator=(const CalculationModeGuard&) = delete;
-
-  private:
-    std::string outer_calculation_;
-};
 } // namespace
 
-void Driver::driver_ipi_run()
+void Driver::driver_ipi_run(const Parameter& param, const int my_rank, std::ofstream& running_log)
 {
     ModuleBase::TITLE("Driver", "driver_ipi_run");
 
     // "socket" is an outer driver mode. The KS/LCAO ESolver internals use the
     // standard SCF code path for each POSDATA request from the i-PI protocol.
-    CalculationModeGuard calculation_guard("scf");
+    Input_para socket_input = param.inp;
+    socket_input.calculation = "scf";
 
     UnitCell ucell;
-    ucell.setup(PARAM.inp.latname, PARAM.inp.ntype, PARAM.inp.lmaxmax, PARAM.inp.init_vel, PARAM.inp.fixed_axes);
-    ucell.setup_cell(PARAM.globalv.global_in_stru, GlobalV::ofs_running);
-    unitcell::check_atomic_stru(ucell, PARAM.inp.min_dist_coef);
+    ucell.setup(socket_input.latname, socket_input.ntype, socket_input.lmaxmax, socket_input.init_vel, socket_input.fixed_axes);
+    ucell.setup_cell(param.globalv.global_in_stru, running_log);
+    unitcell::check_atomic_stru(ucell, socket_input.min_dist_coef);
 
     IpiSocket socket;
     std::unique_ptr<ModuleESolver::ESolver> p_esolver;
@@ -252,8 +233,8 @@ void Driver::driver_ipi_run()
         this->init_hardware();
         hardware_initialized = true;
 
-        p_esolver.reset(ModuleESolver::init_esolver(PARAM.inp, ucell));
-        p_esolver->before_all_runners(ucell, PARAM.inp);
+        p_esolver.reset(ModuleESolver::init_esolver(socket_input, ucell));
+        p_esolver->before_all_runners(ucell, socket_input);
         esolver_ready = true;
 
 #ifdef __RAPIDJSON
@@ -262,12 +243,12 @@ void Driver::driver_ipi_run()
 
         int io_failed = 0;
         std::string io_message;
-        if (is_root())
+        if (is_root(my_rank))
         {
             try
             {
                 const std::string address = ipi_address();
-                GlobalV::ofs_running << " ABACUS socket driver connecting to i-PI endpoint " << address << std::endl;
+                running_log << " ABACUS socket driver connecting to i-PI endpoint " << address << std::endl;
                 socket.connect(address);
             }
             catch (const std::exception& exc)
@@ -276,7 +257,7 @@ void Driver::driver_ipi_run()
                 io_message = exc.what();
             }
         }
-        throw_if_root_io_failed(io_failed, io_message);
+        throw_if_root_io_failed(io_failed, io_message, my_rank);
 
         bool isinit = false;
         bool hasdata = false;
@@ -293,7 +274,7 @@ void Driver::driver_ipi_run()
             std::string header;
             io_failed = 0;
             io_message.clear();
-            if (is_root())
+            if (is_root(my_rank))
             {
                 try
                 {
@@ -305,14 +286,14 @@ void Driver::driver_ipi_run()
                     io_message = exc.what();
                 }
             }
-            throw_if_root_io_failed(io_failed, io_message);
-            header = bcast_header(header);
+            throw_if_root_io_failed(io_failed, io_message, my_rank);
+            header = bcast_header(header, my_rank);
 
             if (header == "STATUS")
             {
                 io_failed = 0;
                 io_message.clear();
-                if (is_root())
+                if (is_root(my_rank))
                 {
                     try
                     {
@@ -335,7 +316,7 @@ void Driver::driver_ipi_run()
                         io_message = exc.what();
                     }
                 }
-                throw_if_root_io_failed(io_failed, io_message);
+                throw_if_root_io_failed(io_failed, io_message, my_rank);
             }
             else if (header == "INIT")
             {
@@ -344,7 +325,7 @@ void Driver::driver_ipi_run()
                 std::string params;
                 io_failed = 0;
                 io_message.clear();
-                if (is_root())
+                if (is_root(my_rank))
                 {
                     try
                     {
@@ -365,17 +346,17 @@ void Driver::driver_ipi_run()
                         io_message = exc.what();
                     }
                 }
-                throw_if_root_io_failed(io_failed, io_message);
+                throw_if_root_io_failed(io_failed, io_message, my_rank);
                 bcast_int(rid);
                 bcast_int(nbytes);
-                if (nbytes > 0 && is_root())
+                if (nbytes > 0 && is_root(my_rank))
                 {
-                    GlobalV::ofs_running << " ABACUS socket INIT params " << params << std::endl;
+                    running_log << " ABACUS socket INIT params " << params << std::endl;
                 }
                 isinit = true;
-                if (is_root())
+                if (is_root(my_rank))
                 {
-                    GlobalV::ofs_running << " ABACUS socket INIT replica " << rid << std::endl;
+                    running_log << " ABACUS socket INIT replica " << rid << std::endl;
                 }
             }
             else if (header == "POSDATA")
@@ -386,7 +367,7 @@ void Driver::driver_ipi_run()
                 std::vector<double> positions;
                 io_failed = 0;
                 io_message.clear();
-                if (is_root())
+                if (is_root(my_rank))
                 {
                     try
                     {
@@ -405,11 +386,11 @@ void Driver::driver_ipi_run()
                         io_message = exc.what();
                     }
                 }
-                throw_if_root_io_failed(io_failed, io_message);
+                throw_if_root_io_failed(io_failed, io_message, my_rank);
                 bcast_double_vector(cell);
                 bcast_double_vector(inv_cell);
                 bcast_int(nat_socket);
-                if (!is_root())
+                if (!is_root(my_rank))
                 {
                     positions.assign(static_cast<std::size_t>(3 * nat_socket), 0.0);
                 }
@@ -430,7 +411,7 @@ void Driver::driver_ipi_run()
                 runner_completed = true;
                 energy_hartree = p_esolver->cal_energy() * RY_TO_HARTREE;
                 ModuleBase::matrix force;
-                if (PARAM.inp.cal_force)
+                if (socket_input.cal_force)
                 {
                     p_esolver->cal_force(ucell, force);
                     forces_hartree_bohr = flatten_forces_hartree_per_bohr(force);
@@ -442,7 +423,7 @@ void Driver::driver_ipi_run()
             {
                 io_failed = 0;
                 io_message.clear();
-                if (is_root())
+                if (is_root(my_rank))
                 {
                     try
                     {
@@ -459,15 +440,15 @@ void Driver::driver_ipi_run()
                         io_message = exc.what();
                     }
                 }
-                throw_if_root_io_failed(io_failed, io_message);
+                throw_if_root_io_failed(io_failed, io_message, my_rank);
                 isinit = false;
                 hasdata = false;
             }
             else
             {
-                if (is_root())
+                if (is_root(my_rank))
                 {
-                    GlobalV::ofs_running << " ABACUS socket driver exiting on header " << header << std::endl;
+                    running_log << " ABACUS socket driver exiting on header " << header << std::endl;
                 }
                 break;
             }
@@ -476,13 +457,13 @@ void Driver::driver_ipi_run()
     catch (const std::exception& exc)
     {
         pending_error = exc.what();
-        if (is_root())
+        if (is_root(my_rank))
         {
-            GlobalV::ofs_running << " ABACUS socket driver ended with error: " << pending_error << std::endl;
+            running_log << " ABACUS socket driver ended with error: " << pending_error << std::endl;
         }
     }
 
-    if (is_root())
+    if (is_root(my_rank))
     {
         socket.close();
     }
@@ -497,7 +478,7 @@ void Driver::driver_ipi_run()
     }
 
 #ifdef __RAPIDJSON
-    Json::create_Json(&ucell, PARAM);
+    Json::create_Json(&ucell, param);
 #endif
 
     if (!pending_error.empty())
