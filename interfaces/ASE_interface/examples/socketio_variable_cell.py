@@ -55,7 +55,7 @@ REQUIRED_FRAME_FIELDS = (
     "atom_count", "forces_ev_per_angstrom", "raw_abacus_stress_kbar",
     "socket_virial_hartree", "ase_stress_ev_per_angstrom3", "thresholds",
 )
-SOURCE_COMMIT_PATTERN = re.compile(r"[0-9a-fA-F]{40}")
+SOURCE_COMMIT_PATTERN = re.compile(r"[0-9a-fA-F]{40}\n?")
 
 
 @dataclass(frozen=True)
@@ -666,36 +666,58 @@ def _raw_stress_and_convergence(directory: Path) -> tuple[list, bool]:
 
 
 def _normalize_source_commit(value: str, source: str) -> str:
-    commit = value.strip()
-    if SOURCE_COMMIT_PATTERN.fullmatch(commit) is None:
+    if SOURCE_COMMIT_PATTERN.fullmatch(value) is None:
         raise AssertionError(
             "{} must contain exactly one 40-hex source commit".format(source))
-    return commit.lower()
+    return (value[:-1] if value.endswith("\n") else value).lower()
 
 
 def resolve_source_commit(script_path: Path | None = None) -> str:
     """Resolve provenance from one explicit source or staged-runtime layout."""
-    script = Path(script_path or __file__).resolve()
+    script = Path(os.path.abspath(os.fspath(script_path or __file__)))
     examples = script.parent
     ase_interface = examples.parent
     layout_root = ase_interface.parent
     if examples.name != "examples" or ase_interface.name != "ASE_interface":
         raise AssertionError("source commit resolver received an unknown layout")
+    for component in (script, examples, ase_interface, layout_root):
+        if component.is_symlink():
+            raise AssertionError(
+                "source commit resolver rejects symlink component {}".format(
+                    component))
+    if not script.is_file():
+        raise AssertionError("source commit resolver script is not a file")
     if layout_root.name == "interfaces":
         repository = layout_root.parent
-        completed = subprocess.run(
+        if repository.is_symlink():
+            raise AssertionError("source checkout repository root is a symlink")
+        top_level = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"], cwd=repository,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            check=False)
+        if top_level.returncode != 0:
+            raise AssertionError("cannot resolve source checkout Git root")
+        reported_root = top_level.stdout[:-1] if top_level.stdout.endswith("\n") \
+            else top_level.stdout
+        if (not reported_root
+                or "\n" in reported_root
+                or Path(reported_root).resolve() != repository.resolve()):
+            raise AssertionError("source checkout Git root does not match layout")
+        head = subprocess.run(
             ["git", "rev-parse", "--verify", "HEAD"], cwd=repository,
             text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             check=False)
-        if completed.returncode != 0:
+        if head.returncode != 0:
             raise AssertionError("cannot resolve source checkout commit")
-        return _normalize_source_commit(completed.stdout, "git rev-parse HEAD")
+        return _normalize_source_commit(head.stdout, "git rev-parse HEAD")
     marker = layout_root / "SOURCE_COMMIT"
+    if marker.is_symlink():
+        raise AssertionError("staged source commit marker is a symlink")
     if not marker.is_file():
         raise AssertionError("staged runtime is missing {}".format(marker))
     try:
-        value = marker.read_text()
-    except OSError as error:
+        value = marker.read_bytes().decode("ascii")
+    except (OSError, UnicodeDecodeError) as error:
         raise AssertionError("cannot read staged source commit marker") from error
     return _normalize_source_commit(value, str(marker))
 
@@ -1014,7 +1036,8 @@ def _analytic_self_test() -> None:
     valid_marker_commit = "a" * 40
     with tempfile.TemporaryDirectory(
             prefix="task7-source-commit-selftest-") as temporary:
-        runtime = Path(temporary) / "runtime"
+        temporary_root = Path(temporary)
+        runtime = temporary_root / "runtime"
         staged_script = runtime / "ASE_interface" / "examples" / Path(__file__).name
         staged_script.parent.mkdir(parents=True)
         staged_script.write_text("# staged layout probe\n")
@@ -1026,8 +1049,13 @@ def _analytic_self_test() -> None:
             "nonhex": "g" * 40,
             "39-hex": "a" * 39,
             "41-hex": "a" * 41,
+            "leading-space": " " + "a" * 40 + "\n",
+            "trailing-space": "a" * 40 + " \n",
+            "extra-blank-line": "a" * 40 + "\n\n",
+            "crlf": "a" * 40 + "\r\n",
             "multiple-conflicting": "a" * 40 + "\n" + "b" * 40,
         }
+        accepted_markers = []
         for label, value in invalid_markers.items():
             marker.write_text(value)
             try:
@@ -1035,7 +1063,10 @@ def _analytic_self_test() -> None:
             except AssertionError:
                 pass
             else:
-                raise AssertionError(label + " source commit marker was accepted")
+                accepted_markers.append(label)
+        if accepted_markers:
+            raise AssertionError("non-exact source commit markers accepted: {}".format(
+                ",".join(accepted_markers)))
         marker.unlink()
         try:
             resolve_source_commit(staged_script)
@@ -1043,8 +1074,68 @@ def _analytic_self_test() -> None:
             pass
         else:
             raise AssertionError("missing source commit marker was accepted")
+
+        def initialize_repository(repository: Path) -> str:
+            repository.mkdir(parents=True)
+            subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
+            (repository / "tracked").write_text("provenance self-test\n")
+            subprocess.run(["git", "add", "tracked"], cwd=repository, check=True)
+            subprocess.run([
+                "git", "-c", "user.name=Task 7 self-test",
+                "-c", "user.email=task7@example.invalid",
+                "commit", "-qm", "provenance self-test",
+            ], cwd=repository, check=True)
+            return subprocess.run(
+                ["git", "rev-parse", "--verify", "HEAD"], cwd=repository,
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                check=True).stdout.strip().lower()
+
+        exact_repository = temporary_root / "exact-repository"
+        exact_commit = initialize_repository(exact_repository)
+        exact_script = (exact_repository / "interfaces" / "ASE_interface"
+                        / "examples" / "probe.py")
+        exact_script.parent.mkdir(parents=True)
+        exact_script.write_text("# exact source checkout probe\n")
+        assert resolve_source_commit(exact_script) == exact_commit
+
+        parent_repository = temporary_root / "parent-repository"
+        initialize_repository(parent_repository)
+        nested_script = (parent_repository / "nested" / "interfaces"
+                         / "ASE_interface" / "examples" / "probe.py")
+        nested_script.parent.mkdir(parents=True)
+        nested_script.write_text("# parent Git collision probe\n")
+
+        symlink_runtime = temporary_root / "symlink-runtime"
+        symlink_script = (symlink_runtime / "ASE_interface" / "examples"
+                          / "probe.py")
+        symlink_script.parent.mkdir(parents=True)
+        symlink_script.symlink_to(self_test_script)
+        (symlink_runtime / "SOURCE_COMMIT").write_text("b" * 40 + "\n")
+
+        component_runtime = temporary_root / "component-runtime"
+        component_runtime.mkdir()
+        (component_runtime / "SOURCE_COMMIT").write_text("c" * 40 + "\n")
+        (component_runtime / "ASE_interface").symlink_to(
+            self_test_script.parents[1], target_is_directory=True)
+        component_script = (component_runtime / "ASE_interface" / "examples"
+                            / self_test_script.name)
+
+        accepted_unsafe_layouts = []
+        for label, unsafe_script in (
+                ("parent-git-collision", nested_script),
+                ("staged-script-symlink", symlink_script),
+                ("staged-component-symlink", component_script)):
+            try:
+                resolve_source_commit(unsafe_script)
+            except AssertionError:
+                pass
+            else:
+                accepted_unsafe_layouts.append(label)
+        if accepted_unsafe_layouts:
+            raise AssertionError("unsafe provenance layouts accepted: {}".format(
+                ",".join(accepted_unsafe_layouts)))
     print("source commit provenance probe: checkout/staged exact 40-hex PASS; "
-          "missing/empty/invalid/multiple markers rejected")
+          "strict marker and lexical Git/symlink collisions rejected")
     atoms = displaced_triclinic_si2()
     base_cell = atoms.cell.array.copy()
     volume = atoms.get_volume()

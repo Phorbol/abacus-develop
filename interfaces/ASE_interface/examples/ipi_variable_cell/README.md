@@ -30,9 +30,16 @@ stage the feature-branch executables, PP/ORB data, and Python environment there:
 
 Task 8 writes the exact, normalized 40-hex feature-branch HEAD to
 `/home/gengjianrui/bin/abacus-variable-cell-runtime/SOURCE_COMMIT` while
-staging this interface. Source-checkout runs resolve the same value from Git;
-staged jobs read this single marker and do not require a Git checkout. A
-missing, empty, malformed, or multi-value marker is a fatal provenance error.
+staging this interface. A source-checkout run accepts only the lexical
+`<repository>/interfaces/ASE_interface/examples/<script>` layout and requires
+Git's canonical top level to equal that candidate repository exactly. A staged
+job accepts only `<runtime>/ASE_interface/examples/<script>`, reads the single
+marker without searching parent directories, and does not require Git. Scripts,
+layout components, repository/runtime roots, and the marker must not be
+symbolic links. Marker contents are exactly 40 hexadecimal characters with at
+most one trailing LF; whitespace, CRLF, extra lines, missing markers, and
+malformed values are fatal provenance errors. Accepted uppercase hexadecimal is
+normalized to lowercase in validation records.
 
 Install the pinned upstream i-PI tag into the existing validation environment:
 
