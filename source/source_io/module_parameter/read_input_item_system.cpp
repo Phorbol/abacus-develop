@@ -158,6 +158,66 @@ When using the ASE AbacusSocketIO interface, this environment variable is set au
         this->add_item(item);
     }
     {
+        Input_Item item("socket_variable_cell");
+        item.annotation = "accept complete cell updates from an external i-PI driver";
+        item.category = "System variables";
+        item.type = "Boolean";
+        item.description = R"(Explicitly opt in to variable-cell socket coupling. When set to True, ABACUS accepts complete 3x3 cell updates from i-PI POSDATA messages.
+
+[NOTE] This mode requires socket_driver = True, calculation = scf, esolver_type = ksdft, and basis_type = pw or lcao. Force and stress calculations are enabled automatically because stress is mandatory for variable-cell coupling. The external driver or barostat owns pressure control, so press1, press2, and press3 must remain zero.)";
+        item.default_value = "False";
+        read_sync_bool(input.socket_variable_cell);
+        item.reset_value = [](const Input_Item& item, Parameter& para) {
+            if (para.input.socket_variable_cell)
+            {
+                para.input.cal_force = true;
+                para.input.cal_stress = true;
+            }
+        };
+        item.check_value = [](const Input_Item& item, const Parameter& para) {
+            if (!para.input.socket_variable_cell)
+            {
+                return;
+            }
+            if (!para.input.socket_driver)
+            {
+                ModuleBase::WARNING_QUIT("ReadInput",
+                                         "socket_variable_cell requires socket_driver = true; conflicting field: socket_driver.");
+            }
+            if (para.input.calculation != "scf")
+            {
+                ModuleBase::WARNING_QUIT("ReadInput",
+                                         "socket_variable_cell requires calculation = scf; conflicting field: calculation.");
+            }
+            if (para.input.esolver_type != "ksdft")
+            {
+                ModuleBase::WARNING_QUIT("ReadInput",
+                                         "socket_variable_cell requires esolver_type = ksdft; conflicting field: esolver_type.");
+            }
+            if (para.input.basis_type != "pw" && para.input.basis_type != "lcao")
+            {
+                ModuleBase::WARNING_QUIT("ReadInput",
+                                         "socket_variable_cell requires basis_type = pw or lcao; conflicting field: basis_type.");
+            }
+            if (para.input.press1 != 0.0)
+            {
+                ModuleBase::WARNING_QUIT("ReadInput",
+                                         "socket_variable_cell requires press1 = 0; conflicting field: press1.");
+            }
+            if (para.input.press2 != 0.0)
+            {
+                ModuleBase::WARNING_QUIT("ReadInput",
+                                         "socket_variable_cell requires press2 = 0; conflicting field: press2.");
+            }
+            if (para.input.press3 != 0.0)
+            {
+                ModuleBase::WARNING_QUIT("ReadInput",
+                                         "socket_variable_cell requires press3 = 0; conflicting field: press3.");
+            }
+        };
+        this->add_item(item);
+    }
+    {
         Input_Item item("esolver_type");
         item.annotation = "the energy solver: ksdft, sdft, ofdft, tdofdft, tddft, lj, dp, ks-lr, lr";
         item.category = "System variables";

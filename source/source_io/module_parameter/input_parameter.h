@@ -20,6 +20,7 @@ struct Input_para
                                         ///< "nscf" : non-self consistent calculation.
                                         ///< "relax" : cell relaxations
     bool socket_driver = false;         ///< run ABACUS as an i-PI socket client
+    bool socket_variable_cell = false;  ///< accept cell updates from i-PI POSDATA
     std::string esolver_type = "ksdft"; ///< the energy solver: ksdft, sdft, ofdft, tddft, lj, dp
     /* symmetry level:
       -1, no symmetry at all;

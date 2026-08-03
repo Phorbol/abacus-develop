@@ -10,6 +10,7 @@
     - [ntype](#ntype)
     - [calculation](#calculation)
     - [socket\_driver](#socket_driver)
+    - [socket\_variable\_cell](#socket_variable_cell)
     - [esolver\_type](#esolver_type)
     - [symmetry](#symmetry)
     - [symmetry\_prec](#symmetry_prec)
@@ -604,6 +605,14 @@
   - host:port, for example localhost:31415 or 127.0.0.1:31415, opens a TCP connection to that host and port. Use this when the i-PI server listens on a TCP port.
   - path:UNIX, for example /tmp/ipi_abacus_si:UNIX, opens a Unix-domain socket at the given filesystem path. The :UNIX suffix tells ABACUS that the preceding value is a local socket path rather than a TCP host name. This form only works on the same machine.
   When using the ASE AbacusSocketIO interface, this environment variable is set automatically from the port or unixsocket calculator argument.
+- **Default**: False
+
+### socket_variable_cell
+
+- **Type**: Boolean
+- **Description**: Explicitly opt in to variable-cell socket coupling. When set to True, ABACUS accepts complete 3x3 cell updates from i-PI POSDATA messages.
+
+  > Note: This mode requires socket_driver = True, calculation = scf, esolver_type = ksdft, and basis_type = pw or lcao. Force and stress calculations are enabled automatically because stress is mandatory for variable-cell coupling. The external driver or barostat owns pressure control, so press1, press2, and press3 must remain zero.
 - **Default**: False
 
 ### esolver_type

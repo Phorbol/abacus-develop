@@ -84,6 +84,86 @@ TEST_F(InputTest, RelaxMethod)
     EXPECT_EQ(find_label("relax_new", readinput.input_lists), readinput.input_lists.end());
 }
 
+TEST_F(InputTest, SocketVariableCell)
+{
+    ModuleIO::ReadInput readinput(0);
+    readinput.check_ntype_flag = false;
+    Parameter param;
+    auto it = find_label("socket_variable_cell", readinput.input_lists);
+    ASSERT_NE(it, readinput.input_lists.end());
+    ModuleIO::Input_Item& item = it->second;
+
+    item.str_values = {"true"};
+    item.read_value(item, param);
+    EXPECT_TRUE(param.input.socket_variable_cell);
+
+    param.input.cal_force = false;
+    param.input.cal_stress = false;
+    item.reset_value(item, param);
+    EXPECT_TRUE(param.input.cal_force);
+    EXPECT_TRUE(param.input.cal_stress);
+
+    param.input.socket_driver = true;
+    param.input.calculation = "scf";
+    param.input.esolver_type = "ksdft";
+    param.input.basis_type = "pw";
+    param.input.press1 = 0.0;
+    param.input.press2 = 0.0;
+    param.input.press3 = 0.0;
+    EXPECT_NO_THROW(item.check_value(item, param));
+
+    param.input.basis_type = "lcao";
+    EXPECT_NO_THROW(item.check_value(item, param));
+
+    param.input.socket_driver = false;
+    testing::internal::CaptureStdout();
+    EXPECT_EXIT(item.check_value(item, param), ::testing::ExitedWithCode(1), "");
+    std::string output = testing::internal::GetCapturedStdout();
+    EXPECT_THAT(output, testing::HasSubstr("socket_driver"));
+    param.input.socket_driver = true;
+
+    param.input.calculation = "md";
+    testing::internal::CaptureStdout();
+    EXPECT_EXIT(item.check_value(item, param), ::testing::ExitedWithCode(1), "");
+    output = testing::internal::GetCapturedStdout();
+    EXPECT_THAT(output, testing::HasSubstr("calculation"));
+    param.input.calculation = "scf";
+
+    param.input.esolver_type = "ofdft";
+    testing::internal::CaptureStdout();
+    EXPECT_EXIT(item.check_value(item, param), ::testing::ExitedWithCode(1), "");
+    output = testing::internal::GetCapturedStdout();
+    EXPECT_THAT(output, testing::HasSubstr("esolver_type"));
+    param.input.esolver_type = "ksdft";
+
+    param.input.basis_type = "lcao_in_pw";
+    testing::internal::CaptureStdout();
+    EXPECT_EXIT(item.check_value(item, param), ::testing::ExitedWithCode(1), "");
+    output = testing::internal::GetCapturedStdout();
+    EXPECT_THAT(output, testing::HasSubstr("basis_type"));
+    param.input.basis_type = "pw";
+
+    param.input.press1 = 1.0;
+    testing::internal::CaptureStdout();
+    EXPECT_EXIT(item.check_value(item, param), ::testing::ExitedWithCode(1), "");
+    output = testing::internal::GetCapturedStdout();
+    EXPECT_THAT(output, testing::HasSubstr("press1"));
+    param.input.press1 = 0.0;
+
+    param.input.press2 = 1.0;
+    testing::internal::CaptureStdout();
+    EXPECT_EXIT(item.check_value(item, param), ::testing::ExitedWithCode(1), "");
+    output = testing::internal::GetCapturedStdout();
+    EXPECT_THAT(output, testing::HasSubstr("press2"));
+    param.input.press2 = 0.0;
+
+    param.input.press3 = 1.0;
+    testing::internal::CaptureStdout();
+    EXPECT_EXIT(item.check_value(item, param), ::testing::ExitedWithCode(1), "");
+    output = testing::internal::GetCapturedStdout();
+    EXPECT_THAT(output, testing::HasSubstr("press3"));
+}
+
 TEST_F(InputTest, Item_test)
 {
     ModuleIO::ReadInput readinput(0);

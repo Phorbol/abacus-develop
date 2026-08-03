@@ -43,6 +43,7 @@ TEST_F(InputParaTest, ParaRead)
     EXPECT_EQ(param.inp.read_file_dir, "OUT.autotest/");
     EXPECT_EQ(param.inp.latname, "none");
     EXPECT_EQ(param.inp.calculation, "scf");
+    EXPECT_FALSE(param.inp.socket_variable_cell);
     EXPECT_EQ(param.inp.esolver_type, "ksdft");
     EXPECT_DOUBLE_EQ(param.inp.pseudo_rcut, 15.0);
     EXPECT_FALSE(param.inp.pseudo_mesh);
