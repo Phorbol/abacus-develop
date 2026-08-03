@@ -16,6 +16,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
@@ -54,6 +55,7 @@ REQUIRED_FRAME_FIELDS = (
     "atom_count", "forces_ev_per_angstrom", "raw_abacus_stress_kbar",
     "socket_virial_hartree", "ase_stress_ev_per_angstrom3", "thresholds",
 )
+SOURCE_COMMIT_PATTERN = re.compile(r"[0-9a-fA-F]{40}")
 
 
 @dataclass(frozen=True)
@@ -235,8 +237,10 @@ def assert_real_frame_schema(record: dict) -> None:
                 "module", "backend", "device", "precision"):
         if not isinstance(record[key], str):
             raise AssertionError(key + " must be a string")
-    if not record["executable_version"] or not record["source_commit"]:
+    if not record["executable_version"]:
         raise AssertionError("identity strings must be nonempty")
+    if re.fullmatch(r"[0-9a-f]{40}", record["source_commit"]) is None:
+        raise AssertionError("source_commit must be normalized 40-hex")
     if (len(record["executable_sha256"]) != 64
             or re.fullmatch(r"[0-9a-fA-F]{64}", record["executable_sha256"]) is None):
         raise AssertionError("executable_sha256 must be 64 hexadecimal characters")
@@ -661,6 +665,41 @@ def _raw_stress_and_convergence(directory: Path) -> tuple[list, bool]:
     return frame["raw_abacus_stress_kbar"], frame["scf_converged"]
 
 
+def _normalize_source_commit(value: str, source: str) -> str:
+    commit = value.strip()
+    if SOURCE_COMMIT_PATTERN.fullmatch(commit) is None:
+        raise AssertionError(
+            "{} must contain exactly one 40-hex source commit".format(source))
+    return commit.lower()
+
+
+def resolve_source_commit(script_path: Path | None = None) -> str:
+    """Resolve provenance from one explicit source or staged-runtime layout."""
+    script = Path(script_path or __file__).resolve()
+    examples = script.parent
+    ase_interface = examples.parent
+    layout_root = ase_interface.parent
+    if examples.name != "examples" or ase_interface.name != "ASE_interface":
+        raise AssertionError("source commit resolver received an unknown layout")
+    if layout_root.name == "interfaces":
+        repository = layout_root.parent
+        completed = subprocess.run(
+            ["git", "rev-parse", "--verify", "HEAD"], cwd=repository,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            check=False)
+        if completed.returncode != 0:
+            raise AssertionError("cannot resolve source checkout commit")
+        return _normalize_source_commit(completed.stdout, "git rev-parse HEAD")
+    marker = layout_root / "SOURCE_COMMIT"
+    if not marker.is_file():
+        raise AssertionError("staged runtime is missing {}".format(marker))
+    try:
+        value = marker.read_text()
+    except OSError as error:
+        raise AssertionError("cannot read staged source commit marker") from error
+    return _normalize_source_commit(value, str(marker))
+
+
 def _identity(config: Config) -> dict:
     command = shlex.split(config.abacus)
     completed = subprocess.run(command + ["--version"], text=True,
@@ -678,12 +717,7 @@ def _identity(config: Config) -> dict:
     if binary is None:
         raise AssertionError("cannot resolve ABACUS executable for hashing")
     digest = hashlib.sha256(binary.read_bytes()).hexdigest()
-    try:
-        source_commit = subprocess.run(
-            ["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parents[3],
-            text=True, stdout=subprocess.PIPE, check=True).stdout.strip()
-    except subprocess.SubprocessError:
-        source_commit = "unknown"
+    source_commit = resolve_source_commit()
     return {"executable_version": match.group(1),
             "executable_sha256": digest, "source_commit": source_commit,
             "module": os.environ.get("LOADEDMODULES", "")}
@@ -760,9 +794,11 @@ def assert_prepare_manifest(manifest: dict) -> None:
         raise AssertionError("prepare manifest identity is incomplete")
     if (not all(isinstance(identity[key], str) for key in
                 ("executable_version", "executable_sha256", "source_commit", "module"))
-            or not identity["executable_version"] or not identity["source_commit"]
+            or not identity["executable_version"]
             or re.fullmatch(r"[0-9a-fA-F]{64}",
-                            identity["executable_sha256"]) is None):
+                            identity["executable_sha256"]) is None
+            or re.fullmatch(r"[0-9a-f]{40}",
+                            identity["source_commit"]) is None):
         raise AssertionError("prepare manifest identity is invalid")
 
 
@@ -963,6 +999,52 @@ def run_validation(config: Config) -> dict:
 def _analytic_self_test() -> None:
     from unittest.mock import patch
     from ase import units
+    self_test_script = Path(__file__).resolve()
+    if self_test_script.parents[2].name == "interfaces":
+        expected_checkout_commit = subprocess.run(
+            ["git", "rev-parse", "--verify", "HEAD"],
+            cwd=self_test_script.parents[3], text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            check=True).stdout.strip().lower()
+        assert resolve_source_commit() == expected_checkout_commit
+    else:
+        assert resolve_source_commit() == _normalize_source_commit(
+            (self_test_script.parents[2] / "SOURCE_COMMIT").read_text(),
+            "self-test staged marker")
+    valid_marker_commit = "a" * 40
+    with tempfile.TemporaryDirectory(
+            prefix="task7-source-commit-selftest-") as temporary:
+        runtime = Path(temporary) / "runtime"
+        staged_script = runtime / "ASE_interface" / "examples" / Path(__file__).name
+        staged_script.parent.mkdir(parents=True)
+        staged_script.write_text("# staged layout probe\n")
+        marker = runtime / "SOURCE_COMMIT"
+        marker.write_text(valid_marker_commit.upper() + "\n")
+        assert resolve_source_commit(staged_script) == valid_marker_commit
+        invalid_markers = {
+            "empty": "",
+            "nonhex": "g" * 40,
+            "39-hex": "a" * 39,
+            "41-hex": "a" * 41,
+            "multiple-conflicting": "a" * 40 + "\n" + "b" * 40,
+        }
+        for label, value in invalid_markers.items():
+            marker.write_text(value)
+            try:
+                resolve_source_commit(staged_script)
+            except AssertionError:
+                pass
+            else:
+                raise AssertionError(label + " source commit marker was accepted")
+        marker.unlink()
+        try:
+            resolve_source_commit(staged_script)
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError("missing source commit marker was accepted")
+    print("source commit provenance probe: checkout/staged exact 40-hex PASS; "
+          "missing/empty/invalid/multiple markers rejected")
     atoms = displaced_triclinic_si2()
     base_cell = atoms.cell.array.copy()
     volume = atoms.get_volume()
@@ -1012,7 +1094,7 @@ def _analytic_self_test() -> None:
         raise AssertionError("left-handed cell was accepted")
     frame = {
         "executable_version": "self-test", "executable_sha256": "0" * 64,
-        "source_commit": "self-test", "module": "self-test",
+        "source_commit": "a" * 40, "module": "self-test",
         "backend": "pw", "device": "cpu", "precision": "double",
         "precision_settings": {"precision": "double", "gint_precision": None,
                                "socket_float": "IEEE-754 binary64"},
@@ -1047,6 +1129,8 @@ def _analytic_self_test() -> None:
         "garbage-force": {"forces_ev_per_angstrom": [["garbage", 0, 0], [0, 0, 0]]},
         "one-by-one-raw-stress": {"raw_abacus_stress_kbar": [[0.0]]},
         "garbage-sha256": {"executable_sha256": "not-a-sha256"},
+        "invalid-source-commit": {"source_commit": "unknown"},
+        "unnormalized-source-commit": {"source_commit": "A" * 40},
         "volume-cell-mismatch": {"volume_angstrom3": 2.0},
         "condition-number-mismatch": {"condition_number": 2.0},
         "boolean-condition-number": {"condition_number": True},
@@ -1074,7 +1158,7 @@ def _analytic_self_test() -> None:
         "socket_variable_cell": True, "cal_stress": True,
         "identity": {"executable_version": "self-test",
                      "executable_sha256": "0" * 64,
-                     "source_commit": "self-test", "module": "self-test"},
+                     "source_commit": "a" * 40, "module": "self-test"},
     }
     assert_prepare_manifest(manifest)
     incomplete_manifest = dict(manifest)
@@ -1089,6 +1173,12 @@ def _analytic_self_test() -> None:
             ("invalid-identity-sha",
              lambda value: value["identity"].update(
                  {"executable_sha256": "invalid"})),
+            ("invalid-source-commit",
+             lambda value: value["identity"].update(
+                 {"source_commit": "unknown"})),
+            ("unnormalized-source-commit",
+             lambda value: value["identity"].update(
+                 {"source_commit": "A" * 40})),
             ("relative-pseudopotential",
              lambda value: value["resolved_files"].update(
                  {"pseudopotential": "Si.upf"}))):

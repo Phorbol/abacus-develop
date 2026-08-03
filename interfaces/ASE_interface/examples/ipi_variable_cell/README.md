@@ -28,6 +28,12 @@ stage the feature-branch executables, PP/ORB data, and Python environment there:
 /home/gengjianrui/bin/abacus-variable-cell-runtime/venv/bin/python
 ```
 
+Task 8 writes the exact, normalized 40-hex feature-branch HEAD to
+`/home/gengjianrui/bin/abacus-variable-cell-runtime/SOURCE_COMMIT` while
+staging this interface. Source-checkout runs resolve the same value from Git;
+staged jobs read this single marker and do not require a Git checkout. A
+missing, empty, malformed, or multi-value marker is a fatal provenance error.
+
 Install the pinned upstream i-PI tag into the existing validation environment:
 
 ```bash

@@ -698,7 +698,7 @@ def _self_test() -> None:
         identity = {
             "executable_version": "self-test",
             "executable_sha256": "0" * 64,
-            "source_commit": "self-test", "module": "self-test",
+            "source_commit": "a" * 40, "module": "self-test",
         }
         from ase import units
         raw_frames = []
@@ -863,7 +863,7 @@ def _self_test() -> None:
             "socket_variable_cell": True, "cal_stress": True,
             "identity": {"executable_version": "self-test",
                          "executable_sha256": "0" * 64,
-                         "source_commit": "self-test", "module": "self-test"},
+                         "source_commit": "a" * 40, "module": "self-test"},
             "official_ipi": {
                 "version": IPI_VERSION,
                 "parser": "Simulation.load_from_xml(read_only=True)",
