@@ -77,6 +77,7 @@
 **Files:**
 - Modify: `source/source_relax/socket_ipi.h`
 - Modify: `source/source_relax/socket_ipi.cpp`
+- Modify: `source/source_relax/socket_driver.cpp` (mechanical integer API call-site rename only)
 - Modify: `source/source_relax/test/socket_ipi_test.cpp`
 
 **Interfaces:**
@@ -126,6 +127,8 @@ cmake --build /tmp/abacus-variable-cell-build-cpu \
 ```
 
 Expected: compilation fails because `read_int32`/`write_int32` do not exist.
+This compile-failure RED is explicitly approved for the brand-new C++ API;
+runtime behavior and boundary cases must still demonstrate assertion-failure RED.
 
 - [ ] **Step 3: Implement explicit wire types and compile-time checks**
 
@@ -169,6 +172,7 @@ Expected: all socket byte/partial-read tests pass.
 ```bash
 git add source/source_relax/socket_ipi.h \
         source/source_relax/socket_ipi.cpp \
+        source/source_relax/socket_driver.cpp \
         source/source_relax/test/socket_ipi_test.cpp
 git commit -m "fix: use explicit i-PI wire integer type"
 ```
