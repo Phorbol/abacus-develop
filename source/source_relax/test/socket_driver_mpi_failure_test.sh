@@ -1,21 +1,48 @@
 #!/usr/bin/env bash
 set -u
 
-mpi_compiler=$1
-test_executable=$2
-mpi_bin_dir=$(dirname "$mpi_compiler")
-mpirun_executable="${mpi_bin_dir}/mpirun"
+mpi_launcher=$1
+numproc_flag=$2
+numprocs=$3
+test_executable=$4
+preflags_count=$5
+postflags_count=$6
+shift 6
 test_output=$(mktemp /tmp/abacus-socket-mpi-failure.XXXXXX)
 trap 'rm -f "$test_output"' EXIT
 
-if [[ ! -x "$mpirun_executable" ]]; then
-    echo "MPI test launcher is not executable: $mpirun_executable"
+if [[ ! $preflags_count =~ ^[0-9]+$ || ! $postflags_count =~ ^[0-9]+$ ]]; then
+    echo "MPI test flag counts must be non-negative integers"
+    exit 1
+fi
+if [[ $# -ne $((preflags_count + postflags_count)) ]]; then
+    echo "MPI test flag count does not match supplied arguments"
     exit 1
 fi
 
+preflags=()
+for ((index = 0; index < preflags_count; ++index)); do
+    preflags+=("$1")
+    shift
+done
+postflags=("$@")
+
+if [[ ! -x "$mpi_launcher" ]]; then
+    echo "MPI test launcher is not executable: $mpi_launcher"
+    exit 1
+fi
+
+mpi_command=("$mpi_launcher")
+if [[ -n $numproc_flag ]]; then
+    mpi_command+=("$numproc_flag")
+fi
+mpi_command+=("$numprocs")
+mpi_command+=("${preflags[@]}")
+mpi_command+=("$test_executable")
+mpi_command+=("${postflags[@]}")
+
 set +e
-/usr/bin/timeout 6 "$mpirun_executable" --oversubscribe -np 2 \
-    "$test_executable" >"$test_output" 2>&1
+/usr/bin/timeout 6 "${mpi_command[@]}" >"$test_output" 2>&1
 launch_status=$?
 set -e
 cat "$test_output"

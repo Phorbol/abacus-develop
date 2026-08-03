@@ -41,14 +41,37 @@ target_link_libraries(
   MODULE_RELAX_socket_driver_mpi_failure_test
   PRIVATE base device cell_info MPI::MPI_CXX Threads::Threads abacus::linalg_libs
 )
-find_program(BASH bash REQUIRED)
+find_program(ABACUS_BASH_EXECUTABLE bash)
+if(NOT ABACUS_BASH_EXECUTABLE)
+  message(FATAL_ERROR "bash is required for the socket driver MPI tests")
+endif()
+list(LENGTH MPIEXEC_PREFLAGS socket_mpi_preflags_count)
+list(LENGTH MPIEXEC_POSTFLAGS socket_mpi_postflags_count)
+add_test(
+  NAME MODULE_RELAX_socket_driver_mpi_failure_wrapper_test
+  COMMAND
+    ${ABACUS_BASH_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/socket_driver_mpi_failure_wrapper_test.sh
+    ${ABACUS_BASH_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/socket_driver_mpi_failure_test.sh
+)
+set_tests_properties(
+  MODULE_RELAX_socket_driver_mpi_failure_wrapper_test
+  PROPERTIES TIMEOUT 5
+)
 add_test(
   NAME MODULE_RELAX_socket_driver_mpi_failure_test
   COMMAND
-    ${BASH}
+    ${ABACUS_BASH_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/socket_driver_mpi_failure_test.sh
-    ${MPI_CXX_COMPILER}
+    ${MPIEXEC_EXECUTABLE}
+    ${MPIEXEC_NUMPROC_FLAG}
+    2
     $<TARGET_FILE:MODULE_RELAX_socket_driver_mpi_failure_test>
+    ${socket_mpi_preflags_count}
+    ${socket_mpi_postflags_count}
+    ${MPIEXEC_PREFLAGS}
+    ${MPIEXEC_POSTFLAGS}
   WORKING_DIRECTORY $<TARGET_FILE_DIR:MODULE_RELAX_socket_driver_mpi_failure_test>
 )
 set_tests_properties(
