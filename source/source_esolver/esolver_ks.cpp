@@ -132,7 +132,7 @@ void ESolver_KS::runner(BaseCell& basecell, const int istep)
     ModuleBase::GlobalFunc::DONE(GlobalV::ofs_running, "INIT SCF");
 
     // 2) SCF iterations
-    bool conv_esolver = false;
+    this->conv_esolver = false;
     this->niter = this->maxniter;
     this->diag_ethr = PARAM.inp.pw_diag_thr;
     this->scf_nmax_flag = false; // mohan add 2025-09-21
@@ -150,10 +150,10 @@ void ESolver_KS::runner(BaseCell& basecell, const int istep)
         this->hamilt2rho(ucell, istep, iter, diag_ethr);
 
         // 5) finish scf iterations
-        this->iter_finish(ucell, istep, iter, conv_esolver);
+        this->iter_finish(ucell, istep, iter, this->conv_esolver);
 
         // 6) check convergence
-        if (conv_esolver || this->oscillate_esolver)
+        if (this->conv_esolver || this->oscillate_esolver)
         {
             this->niter = iter;
             if (this->oscillate_esolver)
@@ -165,7 +165,7 @@ void ESolver_KS::runner(BaseCell& basecell, const int istep)
     } // end scf iterations
 
     // 7) after scf
-    this->after_scf(ucell, istep, conv_esolver);
+    this->after_scf(ucell, istep, this->conv_esolver);
 
     ModuleBase::timer::end(this->classname, "runner");
     return;

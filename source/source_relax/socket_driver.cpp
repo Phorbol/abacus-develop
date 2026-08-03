@@ -466,6 +466,11 @@ void Socket_Driver::socket_driver(ModuleESolver::ESolver* p_esolver,
 
                 set_positions_from_ipi_bohr(ucell, positions);
                 p_esolver->runner(ucell, istep);
+                if (!p_esolver->conv_esolver)
+                {
+                    ModuleBase::WARNING_QUIT("ABACUS socket",
+                                             "SCF did not converge; socket frame will not be published.");
+                }
                 const double energy_ry = p_esolver->cal_energy();
                 energy_hartree = energy_ry * RY_TO_HARTREE;
                 if (is_root())
