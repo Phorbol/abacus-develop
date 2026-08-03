@@ -22,7 +22,10 @@ AddTest(
   LIBS base device
   SOURCES socket_driver_test.cpp
           ../socket_driver.cpp
+          ../socket_frame.cpp
           ../socket_ipi.cpp
+          ../../source_cell/update_cell.cpp
+          ../../source_cell/bcast_cell.cpp
 )
 set_tests_properties(MODULE_RELAX_socket_driver_test PROPERTIES TIMEOUT 15)
 
