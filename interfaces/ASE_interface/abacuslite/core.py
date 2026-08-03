@@ -611,8 +611,9 @@ class AbacusSocketIO(SocketIOCalculator):
         inp = kwargs.pop('inp', {})
         self.variable_cell = self._input_bool(
             variable_cell, 'variable_cell')
-        real_stress = self.variable_cell or self._input_bool(
+        requested_stress = self._input_bool(
             inp.get('cal_stress', False), 'cal_stress')
+        real_stress = self.variable_cell or requested_stress
         self.implemented_properties = ['energy', 'free_energy', 'forces']
         if real_stress:
             self.implemented_properties.append('stress')
@@ -747,6 +748,16 @@ class AbacusSocketIO(SocketIOCalculator):
         calculation = inp.get('calculation', 'scf')
         if calculation != 'scf':
             raise ValueError('ABACUS socket I/O requires calculation="scf"')
+        if ('cal_force' in inp
+                and not AbacusSocketIO._input_bool(
+                    inp['cal_force'], 'cal_force')):
+            raise ValueError(
+                'cal_force conflicts with the socket I/O requirement')
+        if (variable_cell and 'cal_stress' in inp
+                and not AbacusSocketIO._input_bool(
+                    inp['cal_stress'], 'cal_stress')):
+            raise ValueError(
+                'cal_stress conflicts with variable_cell')
         inp.update({
             'calculation': 'scf',
             'socket_driver': 1,
@@ -877,6 +888,26 @@ class TestAbacusCalculator(unittest.TestCase):
 
         self.assertTrue(getattr(calc, 'variable_cell', False))
         self.assertIn('stress', calc.implemented_properties)
+
+    def test_socketio_variable_cell_rejects_disabled_force(self):
+        with self.assertRaisesRegex(ValueError, 'cal_force'):
+            self._make_socketio(
+                variable_cell=True, inp={'cal_force': 0})
+
+    def test_socketio_variable_cell_rejects_disabled_stress(self):
+        with self.assertRaisesRegex(ValueError, 'cal_stress'):
+            self._make_socketio(
+                variable_cell=True, inp={'cal_stress': 0})
+
+    def test_socketio_variable_cell_rejects_ambiguous_force(self):
+        with self.assertRaisesRegex(ValueError, 'cal_force'):
+            self._make_socketio(
+                variable_cell=True, inp={'cal_force': 'maybe'})
+
+    def test_socketio_variable_cell_rejects_ambiguous_stress(self):
+        with self.assertRaisesRegex(ValueError, 'cal_stress'):
+            self._make_socketio(
+                variable_cell=True, inp={'cal_stress': 'maybe'})
 
     def test_socketio_fixed_mode_discards_legacy_zero_virial(self):
         class FakeServer:
