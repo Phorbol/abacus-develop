@@ -41,6 +41,30 @@ IPI_STABILITY_LIMITS = {
 }
 
 
+def assert_json_ready(value, path: str = "$") -> None:
+    """Require a recursively finite, built-in-only JSON payload."""
+    if isinstance(value, (np.ndarray, np.generic)):
+        raise AssertionError("{} contains a NumPy value".format(path))
+    if value is None or isinstance(value, (bool, int, str)):
+        return
+    if isinstance(value, float):
+        if not np.isfinite(value):
+            raise AssertionError("{} contains a non-finite float".format(path))
+        return
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            assert_json_ready(item, "{}[{}]".format(path, index))
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise AssertionError("{} contains a non-string key".format(path))
+            assert_json_ready(item, "{}.{}".format(path, key))
+        return
+    raise AssertionError("{} contains unsupported type {}".format(
+        path, type(value).__name__))
+
+
 @contextlib.contextmanager
 def working_directory(directory: Path):
     previous = Path.cwd()
@@ -329,7 +353,7 @@ def enrich_ipi_frames(parsed: dict, raw_frames: list,
             "is_initial_frame": row["step"] == 0,
             "atom_count": len(row["forces_ev_per_angstrom"]),
             "forces_ev_per_angstrom": row["forces_ev_per_angstrom"],
-            "raw_abacus_stress_kbar": raw_stress,
+            "raw_abacus_stress_kbar": raw_stress.tolist(),
             "socket_virial_hartree": row["virial_hartree"],
             "ase_stress_ev_per_angstrom3": [
                 float(value) for value in ase_stress_voigt],
@@ -556,6 +580,7 @@ def run_validation(config: ase_validation.Config, mode: str, steps: int) -> dict
     }
     if not payload["comparison"]["same_seed"]:
         raise AssertionError("paired probes used different random seeds")
+    assert_json_ready(payload)
     config.output.parent.mkdir(parents=True, exist_ok=True)
     config.output.write_text(json.dumps(payload, indent=2, allow_nan=False) + "\n")
     return payload
@@ -685,6 +710,49 @@ def _self_test() -> None:
             raw_frames.append({"scf_converged": True,
                                "raw_abacus_stress_kbar": raw.tolist()})
         enrich_ipi_frames(parsed, raw_frames, identity, dummy_config)
+        serialization_payload = {
+            "schema_version": 1,
+            "ipi_version": IPI_VERSION,
+            "backend": dummy_config.basis,
+            "device": dummy_config.device,
+            "precision": dummy_config.precision,
+            "initial_cell_angstrom": parsed["steps"][0]["cell_angstrom"],
+            "initial_pressure_gpa_from_fileio": 0.0,
+            "pressure_offset_gpa": 2.0,
+            "pressure_offset_significance": {
+                "pass": True, "active_stress_thresholds":
+                    ase_validation.IDENTICAL_LIMITS,
+            },
+            "paired_probe": {"pass": True},
+            "low_probe": parsed,
+            "high_probe": parsed,
+            "trajectory": parsed,
+            "fileio_reference": parsed["steps"][0],
+            "comparison": {
+                "same_coordinates": True, "same_cell": True,
+                "same_seed": True, "zero_barostat_momentum": True,
+            },
+        }
+        assert_json_ready(serialization_payload)
+        json.dumps(serialization_payload, allow_nan=False)
+        json_ready_target = parsed["steps"][0]
+        for label, invalid_value in (
+                ("ndarray", np.zeros(1)),
+                ("numpy-scalar", np.float64(0.0)),
+                ("nan", float("nan")),
+                ("positive-inf", float("inf")),
+                ("negative-inf", float("-inf"))):
+            json_ready_target["json_ready_mutation"] = invalid_value
+            try:
+                assert_json_ready(serialization_payload)
+            except AssertionError:
+                pass
+            else:
+                raise AssertionError(label + " JSON mutation was accepted")
+            finally:
+                del json_ready_target["json_ready_mutation"]
+        print("official i-PI JSON serialization probe: enriched payload PASS; "
+              "ndarray/NumPy-scalar/NaN/Inf mutations rejected")
         first = parsed["steps"][0]
         assert np.asarray(first["ase_stress_ev_per_angstrom3"]).shape == (6,)
         assert first["precision_settings"]["socket_float"] == "IEEE-754 binary64"

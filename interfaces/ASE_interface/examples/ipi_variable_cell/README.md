@@ -17,8 +17,9 @@ ABACUS_BIN=$(command -v abacus)
 abacus --version
 ```
 
-For later real Task 9/10 runs, use the exact Task 8 shared runtime paths below,
-which contain the staged executables built from this feature branch:
+For later real Task 9/10 runs, use the exact Task 8 shared runtime paths below.
+Task 7 does not create them and they do not exist yet; Task 8 will build and
+stage the feature-branch executables, PP/ORB data, and Python environment there:
 
 ```text
 /home/gengjianrui/bin/abacus-variable-cell-runtime/bin/abacus_basic_para
