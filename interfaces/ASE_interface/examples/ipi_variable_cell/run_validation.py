@@ -7,6 +7,8 @@ import contextlib
 import io
 import json
 import os
+import re
+import signal
 import shlex
 import shutil
 import subprocess
@@ -27,9 +29,16 @@ import socketio_variable_cell as ase_validation
 IPI_VERSION = "3.2.0"
 GPA_PER_EV_ANGSTROM3 = 160.2176634
 BOHR_ANGSTROM = 0.529177210903
-HARTREE_EV = 27.211386245988
 TEMPLATE_KEYS = ("__SOCKET_NAME__", "__TOTAL_STEPS__", "__PRESSURE_GPA__",
                  "__SEED__", "__PREFIX__")
+IPI_VOLUME_LIMITS = {"rtol": 1.0e-10, "atol_bohr3": 1.0e-8}
+PRESSURE_DIRECTION_LIMITS = {"rtol": 1.0e-8, "atol_bohr3": 1.0e-8}
+IPI_STABILITY_LIMITS = {
+    "stale_rtol": 1.0e-10, "stale_atol": 1.0e-12,
+    "max_volume_ratio": 1.25,
+    "conserved_rtol": 5.0e-3, "conserved_atol_ev": 5.0e-2,
+    "flexible_shear_rtol": 1.0e-10, "flexible_shear_atol_bohr": 1.0e-12,
+}
 
 
 @contextlib.contextmanager
@@ -88,19 +97,55 @@ def wait_until(predicate, timeout: float, interval: float = 0.02) -> bool:
     return bool(predicate())
 
 
+def start_managed_process(argv, **kwargs) -> subprocess.Popen:
+    process = subprocess.Popen(argv, start_new_session=True, **kwargs)
+    process.task7_pgid = process.pid
+    return process
+
+
 def terminate_processes(processes: list[subprocess.Popen]) -> None:
-    """Bounded cleanup used from every real/fake runner finally block."""
+    """TERM then KILL complete process groups with bounded waits."""
     for process in reversed(processes):
-        if process.poll() is None:
-            process.terminate()
+        pgid = getattr(process, "task7_pgid", None)
+        try:
+            if pgid is not None:
+                os.killpg(pgid, signal.SIGTERM)
+            elif process.poll() is None:
+                process.terminate()
+        except ProcessLookupError:
+            pass
     deadline = time.monotonic() + 3.0
     for process in reversed(processes):
-        if process.poll() is None:
+        try:
+            process.wait(timeout=max(0.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            pgid = getattr(process, "task7_pgid", None)
             try:
-                process.wait(timeout=max(0.0, deadline - time.monotonic()))
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=2.0)
+                if pgid is not None:
+                    os.killpg(pgid, signal.SIGKILL)
+                else:
+                    process.kill()
+            except ProcessLookupError:
+                pass
+            process.wait(timeout=2.0)
+
+
+def owned_socket_path(socket_name: str) -> Path:
+    if re.fullmatch(r"abacus_vc_[A-Za-z0-9_]+", socket_name) is None:
+        raise AssertionError("refusing unsafe/unowned socket name")
+    path = Path("/tmp") / ("ipi_" + socket_name)
+    if path.parent != Path("/tmp") or path.name != "ipi_" + socket_name:
+        raise AssertionError("socket path escaped ownership boundary")
+    return path
+
+
+def unlink_owned_socket(socket_name: str) -> None:
+    path = owned_socket_path(socket_name)
+    try:
+        if path.is_socket() or path.is_file():
+            path.unlink()
+    except FileNotFoundError:
+        pass
 
 
 def parse_properties(path: Path, expected_steps: int) -> dict:
@@ -115,7 +160,7 @@ def parse_properties(path: Path, expected_steps: int) -> dict:
             values = [float(value) for value in line.split()]
         except ValueError:
             continue
-        if len(values) < 22:
+        if len(values) != 22:
             raise AssertionError("i-PI properties row lacks cell/virial columns")
         if not np.all(np.isfinite(values)):
             raise AssertionError("i-PI properties contain non-finite values")
@@ -136,6 +181,10 @@ def parse_properties(path: Path, expected_steps: int) -> dict:
         condition = float(np.linalg.cond(cell, 2))
         if determinant <= 0.0 or not np.isfinite(condition) or condition >= 1.0e12:
             raise AssertionError("i-PI output cell is invalid")
+        volume_tolerance = (IPI_VOLUME_LIMITS["atol_bohr3"]
+                            + IPI_VOLUME_LIMITS["rtol"] * abs(determinant))
+        if volume <= 0.0 or abs(volume - determinant) > volume_tolerance:
+            raise AssertionError("i-PI volume disagrees with det(cell_h)")
         rows.append({
             "step": int(round(values[0])), "potential_ev": values[1],
             "conserved_ev": values[2], "forces_ev_per_angstrom": forces.tolist(),
@@ -144,8 +193,8 @@ def parse_properties(path: Path, expected_steps: int) -> dict:
             "virial_pressure_hartree_per_bohr3": virial_pressure.tolist(),
             "virial_hartree": (virial_pressure * volume).tolist(),
         })
-    if len(rows) < expected_steps:
-        raise AssertionError("only {} of {} i-PI steps parsed".format(
+    if len(rows) != expected_steps:
+        raise AssertionError("{} rather than exactly {} i-PI steps parsed".format(
             len(rows), expected_steps))
     return {"steps": rows, "completed_steps": len(rows),
             "volume_sequence_bohr3": [row["volume_bohr3"] for row in rows]}
@@ -158,50 +207,93 @@ def paired_pressure_decision(low: dict, high: dict) -> dict:
     high_volumes = np.asarray(high["volume_sequence_bohr3"], dtype=np.float64)
     if low_volumes.size < 5 or high_volumes.size < 5:
         raise AssertionError("paired pressure probe requires five steps per replica")
+    scale = max(abs(low_volumes[-1]), abs(high_volumes[-1]))
+    tolerance = (PRESSURE_DIRECTION_LIMITS["atol_bohr3"]
+                 + PRESSURE_DIRECTION_LIMITS["rtol"] * scale)
+    differences = high_volumes - low_volumes
+    trend = float(np.mean(differences[-2:]) - np.mean(differences[:2]))
     passed = bool(high_target > low_target
-                  and high_volumes[-1] < low_volumes[-1])
+                  and differences[-1] < -tolerance and trend < -tolerance)
     result = {
         "low_target_pressure_gpa": low_target,
         "high_target_pressure_gpa": high_target,
         "low_volume_sequence_bohr3": low_volumes.tolist(),
         "high_volume_sequence_bohr3": high_volumes.tolist(),
         "higher_pressure_has_smaller_final_volume": passed,
+        "paired_high_minus_low_volume_bohr3": differences.tolist(),
+        "trend_last_minus_first_bohr3": trend,
+        "atol_plus_rtol_bohr3": tolerance,
+        "thresholds": PRESSURE_DIRECTION_LIMITS,
     }
     if not passed:
         raise AssertionError("barostat pressure direction is wrong or inconclusive")
     return result
 
 
-def enrich_ipi_frames(parsed: dict, raw_stresses_kbar: list,
+def pressure_offset_significance(stress_ev_per_angstrom3,
+                                 offset_gpa: float,
+                                 config: ase_validation.Config) -> dict:
+    """Require the pressure split to exceed propagated stress uncertainty."""
+    stress = np.asarray(stress_ev_per_angstrom3, dtype=np.float64)
+    if stress.shape != (6,) or not np.all(np.isfinite(stress)):
+        raise AssertionError("pressure reference stress must have six finite values")
+    limits = ase_validation.active_stress_limits(
+        config, ase_validation.IDENTICAL_LIMITS)
+    component_tolerance = (limits["atol_ev_per_angstrom3"]
+                           + limits["rtol"] * np.abs(stress[:3]))
+    pressure_uncertainty = (float(np.mean(component_tolerance))
+                            * GPA_PER_EV_ANGSTROM3)
+    target_separation = 2.0 * float(offset_gpa)
+    required_separation = 2.0 * pressure_uncertainty
+    passed = bool(np.isfinite(offset_gpa) and offset_gpa > 0.0
+                  and target_separation > required_separation)
+    result = {
+        "pass": passed,
+        "precision": config.precision,
+        "active_stress_thresholds": limits,
+        "hydrostatic_component_atol_plus_rtol_ev_per_angstrom3":
+            component_tolerance.tolist(),
+        "propagated_pressure_uncertainty_gpa": pressure_uncertainty,
+        "target_pressure_separation_gpa": target_separation,
+        "required_separation_gpa": required_separation,
+    }
+    if not passed:
+        raise AssertionError("paired pressure offset is below stress uncertainty")
+    return result
+
+
+def enrich_ipi_frames(parsed: dict, raw_frames: list,
                       identity: dict, config: ase_validation.Config) -> None:
+    from ase import units
+    from ase.stress import full_3x3_to_voigt_6_stress
     rows = parsed["steps"]
-    if len(raw_stresses_kbar) < len(rows):
+    if len(raw_frames) != len(rows):
         raise AssertionError("raw ABACUS stresses cannot be matched to i-PI steps")
-    conversion = HARTREE_EV / BOHR_ANGSTROM ** 3
-    for row, raw_stress in zip(rows, raw_stresses_kbar[-len(rows):]):
+    active = ase_validation.active_stress_limits(
+        config, ase_validation.IDENTICAL_LIMITS)
+    for row, raw_frame in zip(rows, raw_frames):
         cell_bohr = np.asarray(row["cell_bohr"], dtype=np.float64)
-        pressure = np.asarray(
-            row["virial_pressure_hartree_per_bohr3"], dtype=np.float64)
-        ase_stress_full = -pressure * conversion
-        ase_stress_voigt = [
-            ase_stress_full[0, 0], ase_stress_full[1, 1],
-            ase_stress_full[2, 2], ase_stress_full[1, 2],
-            ase_stress_full[0, 2], ase_stress_full[0, 1],
-        ]
+        raw_stress = np.asarray(
+            raw_frame["raw_abacus_stress_kbar"], dtype=np.float64)
+        ase_stress_voigt = (
+            -0.1 * units.GPa * full_3x3_to_voigt_6_stress(raw_stress))
         record = dict(identity)
         record.update({
             "source": "official-ipi", "backend": config.basis,
             "device": config.device, "precision": config.precision,
             "precision_settings": {
                 "precision": config.precision,
-                "gint_precision": "double" if config.basis == "lcao" else None,
+                "gint_precision": (None if config.basis == "pw" else
+                                   ("double" if config.precision == "double" else "mix")),
                 "socket_float": "IEEE-754 binary64",
             },
             "cell_angstrom": (cell_bohr * BOHR_ANGSTROM).tolist(),
             "volume_angstrom3": float(row["volume_bohr3"]
                                       * BOHR_ANGSTROM ** 3),
             "condition_number": float(np.linalg.cond(cell_bohr, 2)),
-            "scf_converged": True, "energy_ev": row["potential_ev"],
+            "scf_converged": raw_frame["scf_converged"],
+            "energy_ev": row["potential_ev"],
+            "atom_count": len(row["forces_ev_per_angstrom"]),
             "forces_ev_per_angstrom": row["forces_ev_per_angstrom"],
             "raw_abacus_stress_kbar": raw_stress,
             "socket_virial_hartree": row["virial_hartree"],
@@ -212,12 +304,56 @@ def enrich_ipi_frames(parsed: dict, raw_stresses_kbar: list,
                 "identical": ase_validation.IDENTICAL_LIMITS,
                 "cpu_gpu_double": ase_validation.DOUBLE_LIMITS,
                 "single_mixed_smoke_only": ase_validation.SMOKE_LIMITS,
+                "active_stress": active,
+                "volume": ase_validation.VOLUME_LIMITS,
             },
             "virial_provenance": "official i-PI virial_md times volume",
         })
         ase_validation.assert_real_frame_schema(record)
         row.clear()
         row.update(record)
+
+
+def evaluate_ipi_stability(parsed: dict, mode: str, checkpoint: Path) -> dict:
+    rows = parsed["steps"]
+    cells = np.asarray([row["cell_bohr"] for row in rows], dtype=np.float64)
+    virials = np.asarray([row["virial_hartree"] for row in rows], dtype=np.float64)
+    volumes = np.asarray([row["volume_bohr3"] for row in rows], dtype=np.float64)
+    conserved = np.asarray([row["conserved_ev"] for row in rows], dtype=np.float64)
+    limits = IPI_STABILITY_LIMITS
+    cell_change = float(np.max(np.abs(cells - cells[0])))
+    virial_change = float(np.max(np.abs(virials - virials[0])))
+    cell_stale_tolerance = limits["stale_atol"] + limits["stale_rtol"] * np.max(np.abs(cells))
+    virial_stale_tolerance = limits["stale_atol"] + limits["stale_rtol"] * np.max(np.abs(virials))
+    ratio = float(np.max(volumes) / np.min(volumes))
+    drift = float(np.max(np.abs(conserved - conserved[0])))
+    drift_tolerance = (limits["conserved_atol_ev"] + limits["conserved_rtol"]
+                       * max(1.0, float(np.max(np.abs(conserved)))))
+    shear = cells[:, (0, 0, 1), (1, 2, 2)]
+    shear_change = float(np.max(np.abs(shear - shear[0])))
+    shear_tolerance = (limits["flexible_shear_atol_bohr"]
+                       + limits["flexible_shear_rtol"] * max(1.0, float(np.max(np.abs(shear)))))
+    decisions = {
+        "cell_not_stale": cell_change > cell_stale_tolerance,
+        "virial_not_stale": virial_change > virial_stale_tolerance,
+        "volume_bounded": ratio <= limits["max_volume_ratio"],
+        "conserved_drift_ok": drift <= drift_tolerance,
+        "flexible_shear_changed": (True if mode != "flexible"
+                                   else shear_change > shear_tolerance),
+        "checkpoint_nonempty": checkpoint.is_file() and checkpoint.stat().st_size > 0,
+    }
+    result = {
+        "thresholds": limits, "decisions": decisions,
+        "cell_max_change_bohr": cell_change, "virial_max_change_hartree": virial_change,
+        "volume_ratio": ratio, "conserved_max_drift_ev": drift,
+        "conserved_atol_plus_rtol_ev": drift_tolerance,
+        "flexible_shear_max_change_bohr": shear_change,
+        "flexible_shear_atol_plus_rtol_bohr": shear_tolerance,
+    }
+    failed = [name for name, passed in decisions.items() if not passed]
+    if failed:
+        raise AssertionError("i-PI short-run stability failed: " + ",".join(failed))
+    return result
 
 
 def _ipi_executable() -> Path:
@@ -247,6 +383,43 @@ def _prepare_instance(config: ase_validation.Config, mode: str, run_dir: Path,
     return xml_path, abacus_dir
 
 
+def build_ipi_prepare_manifest(config: ase_validation.Config, mode: str,
+                               steps: int, xml_path: Path,
+                               abacus_dir: Path) -> dict:
+    manifest = ase_validation.build_prepare_manifest(
+        config,
+        {"rendered_xml": xml_path, "abacus": abacus_dir},
+        "ipi-variable-cell",
+        extra={
+            "official_ipi": {
+                "version": IPI_VERSION,
+                "parser": "Simulation.load_from_xml(read_only=True)",
+                "mode": mode,
+                "steps": int(steps),
+            },
+            "xml_template": str((HERE / (mode + ".xml")).resolve()),
+        },
+    )
+    assert_ipi_prepare_manifest(manifest)
+    return manifest
+
+
+def assert_ipi_prepare_manifest(manifest: dict) -> None:
+    ase_validation.assert_prepare_manifest(manifest)
+    if set(manifest["cases"]) != {"rendered_xml", "abacus"}:
+        raise AssertionError("i-PI prepare manifest has unexpected cases")
+    metadata = manifest["official_ipi"]
+    if (not isinstance(metadata, dict)
+            or metadata.get("version") != IPI_VERSION
+            or metadata.get("mode") not in ("isotropic", "flexible")
+            or metadata.get("steps") not in (10, 50)
+            or metadata.get("parser") != "Simulation.load_from_xml(read_only=True)"):
+        raise AssertionError("invalid official i-PI prepare metadata")
+    if (not isinstance(manifest.get("xml_template"), str)
+            or not Path(manifest["xml_template"]).is_absolute()):
+        raise AssertionError("i-PI XML template path must be absolute")
+
+
 def run_instance(config: ase_validation.Config, mode: str, run_dir: Path,
                  steps: int, pressure_gpa: float, seed: int) -> dict:
     socket_name = "abacus_vc_{}_{}_{}".format(mode, os.getpid(), time.time_ns())
@@ -257,9 +430,9 @@ def run_instance(config: ase_validation.Config, mode: str, run_dir: Path,
     ipi_err = open(run_dir / "ipi.stderr", "w")
     abacus_out = open(run_dir / "abacus.stdout", "w")
     abacus_err = open(run_dir / "abacus.stderr", "w")
-    socket_path = Path("/tmp/ipi_" + socket_name)
+    socket_path = owned_socket_path(socket_name)
     try:
-        ipi_process = subprocess.Popen(
+        ipi_process = start_managed_process(
             [str(_ipi_executable()), str(xml_path.name)], cwd=run_dir,
             stdout=ipi_out, stderr=ipi_err)
         processes.append(ipi_process)
@@ -271,7 +444,7 @@ def run_instance(config: ase_validation.Config, mode: str, run_dir: Path,
         environment = os.environ.copy()
         environment["OMP_NUM_THREADS"] = "1"
         environment["ABACUS_SOCKET_ADDRESS"] = str(socket_path) + ":UNIX"
-        abacus_process = subprocess.Popen(
+        abacus_process = start_managed_process(
             shlex.split(config.abacus), cwd=abacus_dir, env=environment,
             stdout=abacus_out, stderr=abacus_err)
         processes.append(abacus_process)
@@ -284,22 +457,30 @@ def run_instance(config: ase_validation.Config, mode: str, run_dir: Path,
             raise TimeoutError("i-PI trajectory exceeded bounded timeout")
         if ipi_process.returncode != 0:
             raise RuntimeError("i-PI exited with {}".format(ipi_process.returncode))
+        try:
+            abacus_process.wait(timeout=10.0)
+        except subprocess.TimeoutExpired as error:
+            raise RuntimeError("ABACUS did not exit after normal i-PI completion") from error
+        if abacus_process.returncode != 0:
+            raise RuntimeError("ABACUS exited with {}".format(abacus_process.returncode))
     finally:
         terminate_processes(processes)
+        unlink_owned_socket(socket_name)
         for stream in (ipi_out, ipi_err, abacus_out, abacus_err):
             stream.close()
     prefix = "{}-{}".format(mode, socket_name)
     parsed = parse_properties(run_dir / (prefix + ".properties"), steps)
-    raw_stresses, convergence_count = (
-        ase_validation.raw_stress_series_and_convergence(abacus_dir, len(parsed["steps"])))
-    enrich_ipi_frames(parsed, raw_stresses, ase_validation._identity(config), config)
+    stability = evaluate_ipi_stability(
+        parsed, mode, run_dir / (prefix + ".checkpoint"))
+    raw_frames = ase_validation.raw_frame_series(abacus_dir, len(parsed["steps"]))
+    enrich_ipi_frames(parsed, raw_frames, ase_validation._identity(config), config)
     parsed.update({
         "mode": mode, "target_pressure_gpa": float(pressure_gpa),
         "seed": int(seed), "requested_steps": int(steps),
         "socket_name": socket_name, "socket_path": str(socket_path),
         "zero_initial_atomic_velocity": True,
         "zero_initial_barostat_momentum": True,
-        "scf_convergence_count": convergence_count,
+        "scf_convergence_count": len(raw_frames), "stability": stability,
     })
     return parsed
 
@@ -312,6 +493,7 @@ def run_validation(config: ase_validation.Config, mode: str, steps: int) -> dict
         config, config.workdir / "fileio_pressure_reference")
     stress = np.asarray(reference["ase_stress_ev_per_angstrom3"], dtype=np.float64)
     pressure_initial = -float(np.mean(stress[:3])) * GPA_PER_EV_ANGSTROM3
+    offset_significance = pressure_offset_significance(stress, 2.0, config)
     seed = 314159
     low_target = pressure_initial - 2.0
     high_target = pressure_initial + 2.0
@@ -329,6 +511,7 @@ def run_validation(config: ase_validation.Config, mode: str, steps: int) -> dict
         "initial_cell_angstrom": reference_atoms.cell.array.tolist(),
         "initial_pressure_gpa_from_fileio": pressure_initial,
         "pressure_offset_gpa": 2.0,
+        "pressure_offset_significance": offset_significance,
         "paired_probe": direction, "low_probe": low, "high_probe": high,
         "trajectory": trajectory, "fileio_reference": reference,
         "comparison": {
@@ -365,35 +548,50 @@ def _self_test() -> None:
                 assert type(system.motion.barostat).__name__ == "BaroMTK"
         properties = directory / "synthetic.properties"
         forces = [0.1, 0.2, 0.3, -0.1, -0.2, -0.3]
-        cell6 = [5.43, 5.21, 5.57, 0.31, 0.17, 0.37]
-        virial6 = [1.0, 1.1, 1.2, 0.1, 0.2, 0.3]
+        base_cell6 = np.array([5.43, 5.21, 5.57, 0.31, 0.17, 0.37])
+        base_virial6 = np.array([1.0, 1.1, 1.2, 0.1, 0.2, 0.3])
         lines = ["# step potential conserved forces volume cell_h virial_md"]
         for step in range(5):
+            cell6 = base_cell6.copy()
+            cell6[:3] *= 1.0 - 1.0e-4 * step
+            cell6[3:] += step * np.array([2.0e-4, -1.0e-4, 3.0e-4])
+            volume = float(np.prod(cell6[:3]))
+            virial6 = base_virial6 + step * 1.0e-3
             values = ([step, -10.0 + step, -9.0] + forces
-                      + [157.0 - step] + cell6 + virial6)
+                      + [volume] + cell6.tolist() + virial6.tolist())
             lines.append(" ".join(format(float(value), ".17g") for value in values))
         properties.write_text("\n".join(lines) + "\n")
         parsed = parse_properties(properties, 5)
         assert parsed["completed_steps"] == 5
-        assert parsed["volume_sequence_bohr3"] == [157.0, 156.0, 155.0, 154.0, 153.0]
         assert parsed["steps"][0]["cell_bohr"] == [
             [5.43, 0.31, 0.17], [0.0, 5.21, 0.37], [0.0, 0.0, 5.57]]
-        assert parsed["steps"][0]["virial_hartree"][0][1] == 15.700000000000001
+        checkpoint = directory / "synthetic.checkpoint"
+        checkpoint.write_text("checkpoint")
+        assert evaluate_ipi_stability(parsed, "flexible", checkpoint)[
+            "decisions"]["flexible_shear_changed"]
         dummy_config = ase_validation.Config(
             "unused", "pw", "cpu", "double", directory,
             directory / "unused.json", directory)
+        single_config = ase_validation.Config(
+            "unused", "pw", "gpu", "single", directory,
+            directory / "unused-single.json", directory)
         identity = {
             "executable_version": "self-test",
             "executable_sha256": "0" * 64,
             "source_commit": "self-test", "module": "self-test",
         }
-        enrich_ipi_frames(parsed, [np.zeros((3, 3)).tolist()] * 5,
-                          identity, dummy_config)
+        from ase import units
+        raw_frames = []
+        for row in parsed["steps"]:
+            volume_ang3 = row["volume_bohr3"] * BOHR_ANGSTROM ** 3
+            virial = np.asarray(row["virial_hartree"], dtype=np.float64)
+            stress_full = -virial * units.Ha / volume_ang3
+            raw = -stress_full / (0.1 * units.GPa)
+            raw_frames.append({"scf_converged": True,
+                               "raw_abacus_stress_kbar": raw.tolist()})
+        enrich_ipi_frames(parsed, raw_frames, identity, dummy_config)
         first = parsed["steps"][0]
-        conversion = HARTREE_EV / BOHR_ANGSTROM ** 3
-        assert np.allclose(
-            first["ase_stress_ev_per_angstrom3"],
-            -conversion * np.array([1.0, 1.1, 1.2, 0.3, 0.2, 0.1]))
+        assert np.asarray(first["ase_stress_ev_per_angstrom3"]).shape == (6,)
         assert first["precision_settings"]["socket_float"] == "IEEE-754 binary64"
         low = {"target_pressure_gpa": -1.0,
                "volume_sequence_bohr3": [150, 151, 152, 153, 154]}
@@ -401,6 +599,16 @@ def _self_test() -> None:
                 "volume_sequence_bohr3": [150, 149, 148, 147, 146]}
         assert paired_pressure_decision(low, high)[
             "higher_pressure_has_smaller_final_volume"]
+        smoke_significance = pressure_offset_significance(
+            np.zeros(6), 2.0, single_config)
+        assert smoke_significance["active_stress_thresholds"] == (
+            ase_validation.SMOKE_LIMITS)
+        try:
+            pressure_offset_significance(np.zeros(6), 0.01, single_config)
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError("pressure offset below single smoke noise was accepted")
         wrong = {"target_pressure_gpa": 3.0,
                  "volume_sequence_bohr3": [150, 151, 152, 153, 154]}
         try:
@@ -409,20 +617,137 @@ def _self_test() -> None:
             pass
         else:
             raise AssertionError("wrong pressure/volume direction was accepted")
+        insignificant = {
+            "target_pressure_gpa": 3.0,
+            "volume_sequence_bohr3": [150, 150, 150, 150, 150 - 1.0e-13]}
+        low_flat = {"target_pressure_gpa": -1.0,
+                    "volume_sequence_bohr3": [150, 150, 150, 150, 150]}
+        try:
+            paired_pressure_decision(low_flat, insignificant)
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError("insignificant pressure response was accepted")
+        # Exact convergence/stress pairing rejects missing and extra frames.
+        logdir = directory / "log" / "OUT.TEST"
+        logdir.mkdir(parents=True)
+        log = logdir / "running_scf.log"
+        block = "#SCF IS CONVERGED#\nTOTAL-STRESS (KBAR)\n1 0 0\n0 1 0\n0 0 1\n"
+        log.write_text(block * 5)
+        assert len(ase_validation.raw_frame_series(logdir.parent, 5)) == 5
+        for count in (4, 6):
+            try:
+                ase_validation.raw_frame_series(logdir.parent, count)
+            except AssertionError:
+                pass
+            else:
+                raise AssertionError("nonexact raw-log frame count was accepted")
+        # Stability mutations: stale, explosion, drift, no flexible shear,
+        # missing checkpoint, and volume/cell mismatch must fail.
+        def raw_parsed():
+            return parse_properties(properties, 5)
+        mutations = []
+        stale = raw_parsed()
+        for row in stale["steps"][1:]:
+            row["cell_bohr"] = stale["steps"][0]["cell_bohr"]
+            row["virial_hartree"] = stale["steps"][0]["virial_hartree"]
+            row["volume_bohr3"] = stale["steps"][0]["volume_bohr3"]
+        mutations.append(("stale", stale, "isotropic", checkpoint))
+        explosion = raw_parsed()
+        explosion["steps"][-1]["volume_bohr3"] *= 2
+        mutations.append(("explosion", explosion, "isotropic", checkpoint))
+        drifted = raw_parsed()
+        drifted["steps"][-1]["conserved_ev"] += 10
+        mutations.append(("drift", drifted, "isotropic", checkpoint))
+        no_shear = raw_parsed()
+        for row in no_shear["steps"]:
+            cell = np.asarray(row["cell_bohr"])
+            cell[0, 1], cell[0, 2], cell[1, 2] = 0.31, 0.17, 0.37
+            row["cell_bohr"] = cell.tolist()
+        mutations.append(("no-shear", no_shear, "flexible", checkpoint))
+        mutations.append(("missing-checkpoint", raw_parsed(), "isotropic",
+                          directory / "absent.checkpoint"))
+        for label, data, mode, check in mutations:
+            try:
+                evaluate_ipi_stability(data, mode, check)
+            except AssertionError:
+                pass
+            else:
+                raise AssertionError(label + " stability mutation was accepted")
+        mismatched = directory / "mismatched.properties"
+        mismatch_lines = properties.read_text().splitlines()
+        mismatch_values = mismatch_lines[1].split()
+        mismatch_values[9] = "999"
+        mismatch_lines[1] = " ".join(mismatch_values)
+        mismatched.write_text("\n".join(mismatch_lines) + "\n")
+        try:
+            parse_properties(mismatched, 5)
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError("volume/determinant mismatch was accepted")
+        prepare_manifest = {
+            "schema_version": 1, "kind": "ipi-variable-cell",
+            "backend": "pw", "device": "cpu", "precision": "double",
+            "gint_precision": None, "is_reference": True,
+            "cases": {"rendered_xml": str(properties.resolve()),
+                      "abacus": str(directory.resolve())},
+            "resolved_files": {
+                "pseudopotential": str(properties.resolve()), "orbital": None},
+            "socket_variable_cell": True, "cal_stress": True,
+            "identity": {"executable_version": "self-test",
+                         "executable_sha256": "0" * 64,
+                         "source_commit": "self-test", "module": "self-test"},
+            "official_ipi": {
+                "version": IPI_VERSION,
+                "parser": "Simulation.load_from_xml(read_only=True)",
+                "mode": "isotropic", "steps": 10},
+            "xml_template": str((HERE / "isotropic.xml").resolve()),
+        }
+        assert_ipi_prepare_manifest(prepare_manifest)
+        invalid_prepare = json.loads(json.dumps(prepare_manifest))
+        del invalid_prepare["official_ipi"]["parser"]
+        try:
+            assert_ipi_prepare_manifest(invalid_prepare)
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError("incomplete i-PI prepare metadata was accepted")
         processes = []
         marker = directory / "marker"
         try:
-            process = subprocess.Popen([
+            child_pid_file = directory / "child.pid"
+            process = start_managed_process([
                 sys.executable, "-c",
-                "import pathlib,time; pathlib.Path(r'{}').write_text('ready'); time.sleep(60)"
-                .format(marker)])
+                ("import pathlib,subprocess,sys,time; "
+                 "c=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)']); "
+                 "pathlib.Path(r'{}').write_text(str(c.pid)); "
+                 "pathlib.Path(r'{}').write_text('ready'); time.sleep(60)")
+                .format(child_pid_file, marker)])
             processes.append(process)
             assert wait_until(marker.exists, timeout=2.0)
             assert not wait_until(lambda: False, timeout=0.05, interval=0.01)
         finally:
             terminate_processes(processes)
         assert process.poll() is not None
-        assert not Path("/tmp/ipi_unique_socket").exists()
+        child_pid = int(child_pid_file.read_text())
+        def child_gone():
+            stat = Path("/proc/{}/stat".format(child_pid))
+            return not stat.exists() or stat.read_text().split()[2] == "Z"
+        assert wait_until(child_gone, 2.0)
+        graceful = start_managed_process([sys.executable, "-c", "raise SystemExit(0)"])
+        assert graceful.wait(timeout=2.0) == 0
+        socket_name = "abacus_vc_selftest"
+        owned = owned_socket_path(socket_name)
+        owned.write_text("owned")
+        unlink_owned_socket(socket_name)
+        assert not owned.exists()
+        try:
+            owned_socket_path("../unsafe")
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError("unsafe socket path was accepted")
     print("run_validation self-test: PASS (official i-PI {})".format(IPI_VERSION))
 
 
@@ -449,7 +774,8 @@ def main() -> None:
     if args.self_test:
         _self_test()
         return
-    output = args.output or args.workdir / "ipi-validation.json"
+    output = args.output or args.workdir / (
+        "prepare.json" if args.prepare_only else "ipi-validation.json")
     config = ase_validation.Config(
         args.abacus, args.basis, args.device, args.precision,
         args.workdir.resolve(), output.resolve(), args.pp_orb_root.resolve())
@@ -457,8 +783,14 @@ def main() -> None:
         raise SystemExit("--pp-orb-root does not exist: {}".format(
             config.pp_orb_root))
     if args.prepare_only:
-        _prepare_instance(config, args.mode, config.workdir / "prepared",
-                          args.steps, 0.0, 314159, "abacus_vc_prepare")
+        xml_path, abacus_dir = _prepare_instance(
+            config, args.mode, config.workdir / "prepared",
+            args.steps, 0.0, 314159, "abacus_vc_prepare")
+        manifest = build_ipi_prepare_manifest(
+            config, args.mode, args.steps, xml_path, abacus_dir)
+        config.output.parent.mkdir(parents=True, exist_ok=True)
+        config.output.write_text(json.dumps(
+            manifest, indent=2, allow_nan=False) + "\n")
         print("prepared parser-validated {} i-PI/ABACUS case in {}".format(
             args.mode, config.workdir))
         return

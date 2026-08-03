@@ -6,7 +6,20 @@ barostat with an upper-triangular skew cell. Both use conservative time steps
 and barostat time constants and write potential, conserved quantity, cell,
 virial, positions, and a checkpoint.
 
-Install the pinned upstream tag into the existing validation environment:
+Use the existing ABACUS develop module and record the exact module/binary in
+every validation artifact. Do not rebuild the full branch merely to prepare
+cases:
+
+```bash
+module av abacus
+module load abacus/develop-git-<site-build>
+ABACUS_BIN=$(command -v abacus)
+abacus --version
+```
+
+For later real Task 9/10 runs, replace `ABACUS_BIN` with the staged executable
+built from this feature branch. Install the pinned upstream i-PI tag into the
+existing validation environment:
 
 ```bash
 /tmp/abacus-variable-cell-venv/bin/pip install \
@@ -24,12 +37,16 @@ Prepare staged inputs (the runner also parses rendered XML with i-PI 3.2.0):
 
 ```bash
 python run_validation.py --prepare-only --basis pw --device cpu \
-  --precision double --abacus /path/to/abacus \
+  --precision double --abacus "$ABACUS_BIN" \
   --pp-orb-root /staged/PP_ORB --workdir prepared-pw
 python run_validation.py --prepare-only --basis lcao --device gpu \
-  --precision double --mode flexible --abacus /path/to/abacus \
+  --precision double --mode flexible --abacus "$ABACUS_BIN" \
   --pp-orb-root /staged/PP_ORB --workdir prepared-lcao-gpu
 ```
+
+Each prepare-only command writes `<workdir>/prepare.json` with absolute case,
+rendered XML, pseudopotential/orbital paths, ABACUS version/hash/source/module,
+backend/device/precision settings, and official i-PI parser metadata.
 
 Real acceptance examples:
 
@@ -59,4 +76,6 @@ does not replace, the ASE validator's six central finite differences at
 Short 10/50-step trajectories establish protocol sign, layout, finite values,
 and local numerical stability only. They are not evidence of thermodynamic
 equilibration. Double precision is the reference. Single/mixed precision uses
-looser smoke thresholds and never establishes signs or reference values.
+looser smoke thresholds for identical-frame, finite-difference, filter, and
+pressure-offset significance decisions. It must still preserve sign, layout,
+and finite behavior, but it does not establish reference values.
