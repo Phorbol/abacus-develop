@@ -29,6 +29,37 @@ AddTest(
 )
 set_tests_properties(MODULE_RELAX_socket_driver_test PROPERTIES TIMEOUT 15)
 
+add_executable(
+  MODULE_RELAX_socket_driver_mpi_failure_test
+  socket_driver_mpi_failure_test.cpp
+  ../socket_driver.cpp
+  ../socket_frame.cpp
+  ../socket_ipi.cpp
+)
+target_compile_definitions(MODULE_RELAX_socket_driver_mpi_failure_test PRIVATE __MPI)
+target_link_libraries(
+  MODULE_RELAX_socket_driver_mpi_failure_test
+  PRIVATE base device cell_info MPI::MPI_CXX Threads::Threads abacus::linalg_libs
+)
+find_program(BASH bash REQUIRED)
+add_test(
+  NAME MODULE_RELAX_socket_driver_mpi_failure_test
+  COMMAND
+    ${BASH}
+    ${CMAKE_CURRENT_SOURCE_DIR}/socket_driver_mpi_failure_test.sh
+    ${MPI_CXX_COMPILER}
+    $<TARGET_FILE:MODULE_RELAX_socket_driver_mpi_failure_test>
+  WORKING_DIRECTORY $<TARGET_FILE_DIR:MODULE_RELAX_socket_driver_mpi_failure_test>
+)
+set_tests_properties(
+  MODULE_RELAX_socket_driver_mpi_failure_test
+  PROPERTIES
+    PROCESSORS 2
+    TIMEOUT 10
+    PASS_REGULAR_EXPRESSION
+      "ABACUS_SOCKET_MPI_FATAL stage=runner rank=1 message=rank-selective runner failure"
+)
+
 AddTest(
   TARGET MODULE_RELAX_relax_new_line_search
   LIBS parameter

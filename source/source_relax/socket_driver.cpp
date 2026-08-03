@@ -14,6 +14,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <exception>
 #include <limits>
@@ -61,6 +62,8 @@ struct PendingAtomPosition
     ModuleBase::Vector3<double> dis;
     ModuleBase::Vector3<int> boundary_shift;
 };
+
+using PendingBoundaryShifts = std::vector<std::vector<ModuleBase::Vector3<int>>>;
 
 bool is_root()
 {
@@ -160,6 +163,26 @@ void throw_if_any_rank_failed(int local_failed, std::string local_message)
         }
         throw std::runtime_error(local_message);
     }
+}
+
+[[noreturn]] void fail_during_collective_stage(const char* stage,
+                                               const std::string& message)
+{
+#ifdef __MPI
+    int rank = -1;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    std::fprintf(stderr,
+                 "ABACUS_SOCKET_MPI_FATAL stage=%s rank=%d message=%s\n",
+                 stage,
+                 rank,
+                 message.c_str());
+    std::fflush(stderr);
+    MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+    std::abort();
+#else
+    (void)stage;
+    throw std::runtime_error(message);
+#endif
 }
 
 std::string bcast_header(std::string header)
@@ -303,12 +326,56 @@ double max_wrapped_direct_delta(const UnitCell& ucell,
     return maximum;
 }
 
-void commit_frame(UnitCell& ucell,
-                  const PendingInputFrame& frame,
-                  const ModuleBase::Matrix3& new_latvec,
-                  const std::vector<PendingAtomPosition>& pending,
-                  std::ofstream& ofs_running,
-                  const int nspin)
+void prepare_commit_storage(const UnitCell& ucell,
+                            const std::vector<PendingAtomPosition>& pending,
+                            PendingBoundaryShifts& boundary_shifts)
+{
+    if (ucell.ntype < 0 || ucell.nat < 0 || ucell.atoms == nullptr)
+    {
+        throw std::runtime_error("UnitCell atom storage is not initialized");
+    }
+    if (pending.size() != static_cast<std::size_t>(ucell.nat))
+    {
+        throw std::runtime_error("pending socket positions do not match UnitCell nat");
+    }
+    boundary_shifts.assign(static_cast<std::size_t>(ucell.ntype),
+                           std::vector<ModuleBase::Vector3<int>>());
+    int iat = 0;
+    for (int it = 0; it < ucell.ntype; ++it)
+    {
+        const Atom* atom = &ucell.atoms[it];
+        if (atom->na < 0
+            || atom->taud.size() < static_cast<std::size_t>(atom->na)
+            || atom->dis.size() < static_cast<std::size_t>(atom->na)
+            || atom->tau.size() < static_cast<std::size_t>(atom->na))
+        {
+            throw std::runtime_error("UnitCell atom position storage is inconsistent");
+        }
+        std::vector<ModuleBase::Vector3<int>>& shifts
+            = boundary_shifts[static_cast<std::size_t>(it)];
+        shifts.resize(static_cast<std::size_t>(atom->na));
+        for (int ia = 0; ia < atom->na; ++ia)
+        {
+            if (iat >= ucell.nat)
+            {
+                throw std::runtime_error("UnitCell species atom counts exceed nat");
+            }
+            shifts[static_cast<std::size_t>(ia)]
+                = pending[static_cast<std::size_t>(iat)].boundary_shift;
+            ++iat;
+        }
+    }
+    if (iat != ucell.nat)
+    {
+        throw std::runtime_error("UnitCell species atom counts do not sum to nat");
+    }
+}
+
+void commit_frame_state(UnitCell& ucell,
+                        const PendingInputFrame& frame,
+                        const ModuleBase::Matrix3& new_latvec,
+                        const std::vector<PendingAtomPosition>& pending,
+                        PendingBoundaryShifts& boundary_shifts)
 {
     if (frame.cell_changed)
     {
@@ -318,23 +385,18 @@ void commit_frame(UnitCell& ucell,
     for (int it = 0; it < ucell.ntype; ++it)
     {
         Atom* atom = &ucell.atoms[it];
-        atom->boundary_shift.resize(static_cast<std::size_t>(atom->na));
         for (int ia = 0; ia < atom->na; ++ia)
         {
             const PendingAtomPosition& position = pending[static_cast<std::size_t>(iat)];
             atom->taud[ia] = position.taud;
             atom->dis[ia] = position.dis;
-            atom->boundary_shift[ia] = position.boundary_shift;
             ++iat;
         }
+        atom->boundary_shift.swap(boundary_shifts[static_cast<std::size_t>(it)]);
     }
     ucell.ionic_position_updated = true;
     ucell.cell_parameter_updated = frame.cell_changed;
-    if (frame.cell_changed)
-    {
-        unitcell::setup_cell_after_vc(ucell, ofs_running, nspin);
-    }
-    else
+    if (!frame.cell_changed)
     {
         for (int it = 0; it < ucell.ntype; ++it)
         {
@@ -654,6 +716,7 @@ void Socket_Driver::socket_driver(ModuleESolver::ESolver* p_esolver,
                 std::string local_message;
                 ModuleBase::Matrix3 new_latvec;
                 std::vector<PendingAtomPosition> pending_positions;
+                PendingBoundaryShifts pending_boundary_shifts;
                 SocketFrame::Matrix9 scaled_abacus_cell;
                 try
                 {
@@ -683,6 +746,9 @@ void Socket_Driver::socket_driver(ModuleESolver::ESolver* p_esolver,
                     {
                         throw std::runtime_error(position_message);
                     }
+                    prepare_commit_storage(ucell,
+                                           pending_positions,
+                                           pending_boundary_shifts);
                 }
                 catch (const std::exception& exc)
                 {
@@ -709,24 +775,55 @@ void Socket_Driver::socket_driver(ModuleESolver::ESolver* p_esolver,
 
                 published = ComputedFrame();
                 ComputedFrame computed;
-                local_failed = 0;
-                local_message.clear();
                 try
                 {
-                    commit_frame(ucell, frame, new_latvec, pending_positions, ofs_running, inp.nspin);
+                    commit_frame_state(ucell,
+                                       frame,
+                                       new_latvec,
+                                       pending_positions,
+                                       pending_boundary_shifts);
+                }
+                catch (const std::exception& exc)
+                {
+                    fail_during_collective_stage("cell-commit", exc.what());
+                }
+                catch (...)
+                {
+                    fail_during_collective_stage("cell-commit",
+                                                 "unknown socket cell commit failure");
+                }
+
+                if (frame.cell_changed)
+                {
+                    try
+                    {
+                        unitcell::setup_cell_after_vc(ucell, ofs_running, inp.nspin);
+                    }
+                    catch (const std::exception& exc)
+                    {
+                        fail_during_collective_stage("setup_cell_after_vc", exc.what());
+                    }
+                    catch (...)
+                    {
+                        fail_during_collective_stage(
+                            "setup_cell_after_vc",
+                            "unknown socket setup_cell_after_vc failure");
+                    }
+                }
+
+                try
+                {
                     p_esolver->runner(ucell, istep);
                 }
                 catch (const std::exception& exc)
                 {
-                    local_failed = 1;
-                    local_message = exc.what();
+                    fail_during_collective_stage("runner", exc.what());
                 }
                 catch (...)
                 {
-                    local_failed = 1;
-                    local_message = "unknown socket runner failure";
+                    fail_during_collective_stage("runner",
+                                                 "unknown socket runner failure");
                 }
-                throw_if_any_rank_failed(local_failed, local_message);
 
                 local_failed = p_esolver->conv_esolver ? 0 : 1;
                 local_message = local_failed != 0 ? "socket step SCF did not converge" : "";
@@ -738,23 +835,20 @@ void Socket_Driver::socket_driver(ModuleESolver::ESolver* p_esolver,
                 try
                 {
                     energy_ry = p_esolver->cal_energy();
-                    if (!std::isfinite(energy_ry))
-                    {
-                        throw std::runtime_error("energy must be finite");
-                    }
-                    computed.energy_hartree = energy_ry * RY_TO_HARTREE;
                 }
                 catch (const std::exception& exc)
                 {
-                    local_failed = 1;
-                    local_message = exc.what();
+                    fail_during_collective_stage("cal_energy", exc.what());
                 }
                 catch (...)
                 {
-                    local_failed = 1;
-                    local_message = "unknown socket energy failure";
+                    fail_during_collective_stage("cal_energy",
+                                                 "unknown socket energy failure");
                 }
+                local_failed = std::isfinite(energy_ry) ? 0 : 1;
+                local_message = local_failed != 0 ? "energy must be finite" : "";
                 throw_if_any_rank_failed(local_failed, local_message);
+                computed.energy_hartree = energy_ry * RY_TO_HARTREE;
                 if (is_root())
                 {
                     ofs_running << " ABACUS socket return energy "
@@ -765,10 +859,22 @@ void Socket_Driver::socket_driver(ModuleESolver::ESolver* p_esolver,
 
                 local_failed = 0;
                 local_message.clear();
+                ModuleBase::matrix force;
                 try
                 {
-                    ModuleBase::matrix force;
                     p_esolver->cal_force(ucell, force);
+                }
+                catch (const std::exception& exc)
+                {
+                    fail_during_collective_stage("cal_force", exc.what());
+                }
+                catch (...)
+                {
+                    fail_during_collective_stage("cal_force",
+                                                 "unknown socket force failure");
+                }
+                try
+                {
                     computed.forces_hartree_per_bohr
                         = flatten_forces_hartree_per_bohr(force, ucell.nat);
                 }
@@ -788,10 +894,22 @@ void Socket_Driver::socket_driver(ModuleESolver::ESolver* p_esolver,
                 {
                     local_failed = 0;
                     local_message.clear();
+                    ModuleBase::matrix stress;
                     try
                     {
-                        ModuleBase::matrix stress;
                         p_esolver->cal_stress(ucell, stress);
+                    }
+                    catch (const std::exception& exc)
+                    {
+                        fail_during_collective_stage("cal_stress", exc.what());
+                    }
+                    catch (...)
+                    {
+                        fail_during_collective_stage("cal_stress",
+                                                     "unknown socket stress failure");
+                    }
+                    try
+                    {
                         const SocketFrame::VirialConversion virial
                             = SocketFrame::make_ipi_virial(matrix9_from_stress(stress),
                                                            ucell.omega,
