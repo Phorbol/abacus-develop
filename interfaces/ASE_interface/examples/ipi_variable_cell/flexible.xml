@@ -1,0 +1,37 @@
+<simulation verbosity="medium">
+  <output prefix="__PREFIX__">
+    <properties stride="1" filename="properties">[ step, potential{electronvolt}, conserved{electronvolt}, forces{electronvolt/angstrom}, volume, cell_h, virial_md ]</properties>
+    <trajectory stride="1" filename="positions" format="xyz" cell_units="angstrom">positions{angstrom}</trajectory>
+    <checkpoint stride="__TOTAL_STEPS__" filename="checkpoint"/>
+  </output>
+  <total_steps>__TOTAL_STEPS__</total_steps>
+  <prng><seed>__SEED__</seed></prng>
+  <ffsocket name="abacus" mode="unix">
+    <address>__SOCKET_NAME__</address>
+    <timeout>300</timeout>
+    <latency>0.01</latency>
+  </ffsocket>
+  <system>
+    <initialize nbeads="1">
+      <file mode="xyz" units="angstrom">init.xyz</file>
+      <cell mode="manual" units="angstrom">[5.43, 0.31, 0.17, 0, 5.21, 0.37, 0, 0, 5.57]</cell>
+      <velocities mode="manual" units="angstrom/femtosecond">[0, 0, 0, 0, 0, 0]</velocities>
+    </initialize>
+    <forces><force forcefield="abacus"/></forces>
+    <ensemble>
+      <temperature units="kelvin">100</temperature>
+      <pressure units="gigapascal">__PRESSURE_GPA__</pressure>
+    </ensemble>
+    <motion mode="dynamics">
+      <dynamics mode="npt">
+        <barostat mode="flexible">
+          <tau units="femtosecond">750</tau>
+          <thermostat mode="langevin"><tau units="femtosecond">300</tau></thermostat>
+        </barostat>
+        <thermostat mode="langevin"><tau units="femtosecond">300</tau></thermostat>
+        <timestep units="femtosecond">0.05</timestep>
+      </dynamics>
+      <fixcom>True</fixcom>
+    </motion>
+  </system>
+</simulation>
