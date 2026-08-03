@@ -8,12 +8,16 @@
 #include "for_test.h"
 
 #include <cerrno>
+#include <chrono>
+#include <climits>
+#include <csignal>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <exception>
+#include <fcntl.h>
 #include <fstream>
 #include <iostream>
+#include <poll.h>
 #include <stdexcept>
 #include <string>
 #include <sys/socket.h>
@@ -38,29 +42,255 @@ void periodic_boundary_adjustment(Atom* atoms, const ModuleBase::Matrix3& latvec
 namespace
 {
 constexpr std::size_t IPI_HEADER_LEN = 12;
+constexpr int DRIVER_DEADLINE_MS = 5000;
+constexpr int CHILD_TERM_GRACE_MS = 250;
+constexpr int CHILD_KILL_GRACE_MS = 1000;
 
 std::string errno_message(const std::string& prefix)
 {
     return prefix + ": " + std::strerror(errno);
 }
 
-void send_all(const int fd, const void* data, const std::size_t nbytes)
+class MonotonicDeadline
+{
+  public:
+    explicit MonotonicDeadline(const int timeout_ms)
+        : expires_(std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms))
+    {
+    }
+
+    int remaining_ms() const
+    {
+        const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+        if (now >= expires_)
+        {
+            return 0;
+        }
+        const long long remaining
+            = std::chrono::duration_cast<std::chrono::milliseconds>(expires_ - now).count();
+        if (remaining >= INT_MAX)
+        {
+            return INT_MAX;
+        }
+        return static_cast<int>(remaining > 0 ? remaining : 1);
+    }
+
+  private:
+    std::chrono::steady_clock::time_point expires_;
+};
+
+class UniqueFd
+{
+  public:
+    explicit UniqueFd(const int fd = -1) : fd_(fd)
+    {
+    }
+
+    ~UniqueFd()
+    {
+        reset();
+    }
+
+    UniqueFd(const UniqueFd&) = delete;
+    UniqueFd& operator=(const UniqueFd&) = delete;
+
+    int get() const
+    {
+        return fd_;
+    }
+
+    void reset(const int fd = -1)
+    {
+        if (fd_ >= 0)
+        {
+            ::close(fd_);
+        }
+        fd_ = fd;
+    }
+
+  private:
+    int fd_;
+};
+
+void set_nonblocking(const int fd)
+{
+    const int flags = ::fcntl(fd, F_GETFL, 0);
+    if (flags < 0 || ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0)
+    {
+        throw std::runtime_error(errno_message("fcntl failed"));
+    }
+}
+
+void wait_for_fd(const int fd,
+                 const short events,
+                 const MonotonicDeadline& deadline,
+                 const std::string& operation)
+{
+    while (true)
+    {
+        const int timeout_ms = deadline.remaining_ms();
+        if (timeout_ms == 0)
+        {
+            throw std::runtime_error(operation + " timed out");
+        }
+
+        pollfd descriptor;
+        descriptor.fd = fd;
+        descriptor.events = events;
+        descriptor.revents = 0;
+        const int result = ::poll(&descriptor, 1, timeout_ms);
+        if (result == 0)
+        {
+            throw std::runtime_error(operation + " timed out");
+        }
+        if (result < 0)
+        {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+            throw std::runtime_error(errno_message(operation + " poll failed"));
+        }
+        if ((descriptor.revents & POLLNVAL) != 0)
+        {
+            throw std::runtime_error(operation + " encountered an invalid descriptor");
+        }
+        if ((descriptor.revents & (events | POLLERR | POLLHUP)) != 0)
+        {
+            return;
+        }
+    }
+}
+
+class ChildProcess
+{
+  public:
+    explicit ChildProcess(const pid_t pid) : pid_(pid)
+    {
+    }
+
+    ~ChildProcess()
+    {
+        terminate_and_reap();
+    }
+
+    ChildProcess(const ChildProcess&) = delete;
+    ChildProcess& operator=(const ChildProcess&) = delete;
+
+    int wait_until(const MonotonicDeadline& deadline)
+    {
+        while (true)
+        {
+            int status = 0;
+            const pid_t result = ::waitpid(pid_, &status, WNOHANG);
+            if (result == pid_)
+            {
+                pid_ = -1;
+                return status;
+            }
+            if (result < 0)
+            {
+                if (errno == EINTR)
+                {
+                    continue;
+                }
+                if (errno == ECHILD)
+                {
+                    pid_ = -1;
+                }
+                throw std::runtime_error(errno_message("waitpid failed"));
+            }
+
+            const int remaining_ms = deadline.remaining_ms();
+            if (remaining_ms == 0)
+            {
+                throw std::runtime_error("child wait timed out");
+            }
+            ::poll(nullptr, 0, remaining_ms < 10 ? remaining_ms : 10);
+        }
+    }
+
+  private:
+    bool reap_for(const int timeout_ms) noexcept
+    {
+        const std::chrono::steady_clock::time_point expires
+            = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+        while (pid_ > 0)
+        {
+            int status = 0;
+            const pid_t result = ::waitpid(pid_, &status, WNOHANG);
+            if (result == pid_ || (result < 0 && errno == ECHILD))
+            {
+                pid_ = -1;
+                return true;
+            }
+            if (result < 0 && errno != EINTR)
+            {
+                return false;
+            }
+            if (std::chrono::steady_clock::now() >= expires)
+            {
+                return false;
+            }
+            ::poll(nullptr, 0, 10);
+        }
+        return true;
+    }
+
+    void terminate_and_reap() noexcept
+    {
+        if (pid_ <= 0 || reap_for(0))
+        {
+            return;
+        }
+        static_cast<void>(::kill(pid_, SIGTERM));
+        if (reap_for(CHILD_TERM_GRACE_MS))
+        {
+            return;
+        }
+        static_cast<void>(::kill(pid_, SIGKILL));
+        static_cast<void>(reap_for(CHILD_KILL_GRACE_MS));
+    }
+
+    pid_t pid_;
+};
+
+class PeerClosed : public std::runtime_error
+{
+  public:
+    explicit PeerClosed(const std::string& message) : std::runtime_error(message)
+    {
+    }
+};
+
+void send_all(const int fd,
+              const void* data,
+              const std::size_t nbytes,
+              const MonotonicDeadline& deadline)
 {
     const char* cursor = static_cast<const char*>(data);
     std::size_t done = 0;
     while (done < nbytes)
     {
+        wait_for_fd(fd, POLLOUT, deadline, "socket send");
 #ifdef MSG_NOSIGNAL
-        const int flags = MSG_NOSIGNAL;
+        int flags = MSG_NOSIGNAL;
 #else
-        const int flags = 0;
+        int flags = 0;
+#endif
+#ifdef MSG_DONTWAIT
+        flags |= MSG_DONTWAIT;
 #endif
         const ssize_t sent = ::send(fd, cursor + done, nbytes - done, flags);
         if (sent < 0)
         {
-            if (errno == EINTR)
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
             {
                 continue;
+            }
+            if (errno == EPIPE || errno == ECONNRESET)
+            {
+                throw PeerClosed(errno_message("socket peer closed during send"));
             }
             throw std::runtime_error(errno_message("send failed"));
         }
@@ -73,42 +303,44 @@ void send_all(const int fd, const void* data, const std::size_t nbytes)
 }
 
 template <typename T>
-void send_value(const int fd, const T& value)
+void send_value(const int fd, const T& value, const MonotonicDeadline& deadline)
 {
-    send_all(fd, &value, sizeof(value));
+    send_all(fd, &value, sizeof(value), deadline);
 }
 
-void send_header(const int fd, const std::string& header)
+void send_header(const int fd, const std::string& header, const MonotonicDeadline& deadline)
 {
     std::string padded = header;
     padded.resize(IPI_HEADER_LEN, ' ');
-    send_all(fd, padded.data(), padded.size());
+    send_all(fd, padded.data(), padded.size(), deadline);
 }
 
-bool try_send_status(const int fd)
+bool try_send_status(const int fd, const MonotonicDeadline& deadline)
 {
     try
     {
-        send_header(fd, "STATUS");
+        send_header(fd, "STATUS", deadline);
         return true;
     }
-    catch (const std::runtime_error&)
+    catch (const PeerClosed&)
     {
-        if (errno == EPIPE || errno == ECONNRESET)
-        {
-            return false;
-        }
-        throw;
+        return false;
     }
 }
 
-std::string read_header_or_close(const int fd)
+std::string read_header_or_close(const int fd, const MonotonicDeadline& deadline)
 {
     char header[IPI_HEADER_LEN];
     std::size_t done = 0;
     while (done < sizeof(header))
     {
-        const ssize_t received = ::recv(fd, header + done, sizeof(header) - done, 0);
+        wait_for_fd(fd, POLLIN, deadline, "socket receive");
+#ifdef MSG_DONTWAIT
+        const int flags = MSG_DONTWAIT;
+#else
+        const int flags = 0;
+#endif
+        const ssize_t received = ::recv(fd, header + done, sizeof(header) - done, flags);
         if (received == 0 || (received < 0 && errno == ECONNRESET))
         {
             if (done == 0)
@@ -119,7 +351,7 @@ std::string read_header_or_close(const int fd)
         }
         if (received < 0)
         {
-            if (errno == EINTR)
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
             {
                 continue;
             }
@@ -168,6 +400,7 @@ class UnixSocketServer
         {
             throw std::runtime_error(errno_message("listen failed"));
         }
+        set_nonblocking(listen_fd_);
     }
 
     ~UnixSocketServer()
@@ -194,14 +427,30 @@ class UnixSocketServer
         return path_ + ":UNIX";
     }
 
-    int accept_once() const
+    int accept_until(const MonotonicDeadline& deadline) const
     {
-        const int fd = ::accept(listen_fd_, nullptr, nullptr);
-        if (fd < 0)
+        while (true)
         {
-            throw std::runtime_error(errno_message("accept failed"));
+            wait_for_fd(listen_fd_, POLLIN, deadline, "socket accept");
+            const int fd = ::accept(listen_fd_, nullptr, nullptr);
+            if (fd >= 0)
+            {
+                try
+                {
+                    set_nonblocking(fd);
+                }
+                catch (...)
+                {
+                    ::close(fd);
+                    throw;
+                }
+                return fd;
+            }
+            if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK)
+            {
+                throw std::runtime_error(errno_message("accept failed"));
+            }
         }
-        return fd;
     }
 
   private:
@@ -256,6 +505,12 @@ struct DriverResult
     std::string diagnostic;
 };
 
+enum class ChildMode
+{
+    run_driver,
+    stall_before_connect
+};
+
 void initialize_one_atom_cell(UnitCell& ucell)
 {
     ucell.lat0 = 1.0;
@@ -268,32 +523,33 @@ void initialize_one_atom_cell(UnitCell& ucell)
     ucell.atoms[0].dis.resize(1);
 }
 
-void send_fixed_cell_frame(const int fd)
+void send_fixed_cell_frame(const int fd, const MonotonicDeadline& deadline)
 {
     const std::int32_t replica = 0;
     const std::int32_t parameter_bytes = 0;
-    send_header(fd, "INIT");
-    send_value(fd, replica);
-    send_value(fd, parameter_bytes);
+    send_header(fd, "INIT", deadline);
+    send_value(fd, replica, deadline);
+    send_value(fd, parameter_bytes, deadline);
 
     const double identity[9] = {1.0, 0.0, 0.0,
                                 0.0, 1.0, 0.0,
                                 0.0, 0.0, 1.0};
     const std::int32_t nat = 1;
     const double position[3] = {0.0, 0.0, 0.0};
-    send_header(fd, "POSDATA");
-    send_all(fd, identity, sizeof(identity));
-    send_all(fd, identity, sizeof(identity));
-    send_value(fd, nat);
-    send_all(fd, position, sizeof(position));
+    send_header(fd, "POSDATA", deadline);
+    send_all(fd, identity, sizeof(identity), deadline);
+    send_all(fd, identity, sizeof(identity), deadline);
+    send_value(fd, nat, deadline);
+    send_all(fd, position, sizeof(position), deadline);
 }
 
-std::string read_pipe(const int fd)
+std::string read_pipe(const int fd, const MonotonicDeadline& deadline)
 {
     std::string output;
     char buffer[512];
     while (true)
     {
+        wait_for_fd(fd, POLLIN, deadline, "diagnostic pipe read");
         const ssize_t nread = ::read(fd, buffer, sizeof(buffer));
         if (nread == 0)
         {
@@ -301,7 +557,7 @@ std::string read_pipe(const int fd)
         }
         if (nread < 0)
         {
-            if (errno == EINTR)
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
             {
                 continue;
             }
@@ -312,29 +568,44 @@ std::string read_pipe(const int fd)
     return output;
 }
 
-DriverResult run_driver_frame(const bool converged)
+DriverResult run_driver_frame(const bool converged,
+                              const ChildMode child_mode,
+                              const int timeout_ms,
+                              pid_t* observed_child)
 {
+    const MonotonicDeadline deadline(timeout_ms);
     UnixSocketServer server;
     int output_pipe[2];
     if (::pipe(output_pipe) != 0)
     {
         throw std::runtime_error(errno_message("pipe failed"));
     }
+    UniqueFd output_read(output_pipe[0]);
+    UniqueFd output_write(output_pipe[1]);
 
     const pid_t child = ::fork();
     if (child < 0)
     {
-        ::close(output_pipe[0]);
-        ::close(output_pipe[1]);
         throw std::runtime_error(errno_message("fork failed"));
     }
     if (child == 0)
     {
-        ::close(output_pipe[0]);
-        ::dup2(output_pipe[1], STDOUT_FILENO);
-        ::dup2(output_pipe[1], STDERR_FILENO);
-        ::close(output_pipe[1]);
-        ::setenv("ABACUS_SOCKET_ADDRESS", server.address().c_str(), 1);
+        output_read.reset();
+        if (::dup2(output_write.get(), STDOUT_FILENO) < 0
+            || ::dup2(output_write.get(), STDERR_FILENO) < 0
+            || ::setenv("ABACUS_SOCKET_ADDRESS", server.address().c_str(), 1) != 0)
+        {
+            ::_exit(2);
+        }
+        output_write.reset();
+
+        if (child_mode == ChildMode::stall_before_connect)
+        {
+            while (true)
+            {
+                ::pause();
+            }
+        }
 
         UnitCell ucell;
         initialize_one_atom_cell(ucell);
@@ -349,61 +620,103 @@ DriverResult run_driver_frame(const bool converged)
         ::_exit(0);
     }
 
-    ::close(output_pipe[1]);
+    if (observed_child != nullptr)
+    {
+        *observed_child = child;
+    }
+    ChildProcess child_process(child);
+    output_write.reset();
+    set_nonblocking(output_read.get());
     DriverResult result;
-    std::exception_ptr peer_error;
-    int peer_fd = -1;
-    try
+    UniqueFd peer(server.accept_until(deadline));
+    send_fixed_cell_frame(peer.get(), deadline);
+    if (try_send_status(peer.get(), deadline))
     {
-        peer_fd = server.accept_once();
-        timeval timeout;
-        timeout.tv_sec = 5;
-        timeout.tv_usec = 0;
-        if (::setsockopt(peer_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0)
-        {
-            throw std::runtime_error(errno_message("setsockopt failed"));
-        }
-        send_fixed_cell_frame(peer_fd);
-        if (try_send_status(peer_fd))
-        {
-            result.response_header = read_header_or_close(peer_fd);
-        }
+        result.response_header = read_header_or_close(peer.get(), deadline);
     }
-    catch (...)
-    {
-        peer_error = std::current_exception();
-    }
-    if (peer_fd >= 0)
-    {
-        ::close(peer_fd);
-    }
+    peer.reset();
 
-    result.diagnostic = read_pipe(output_pipe[0]);
-    ::close(output_pipe[0]);
-    int status = 0;
-    while (::waitpid(child, &status, 0) < 0)
-    {
-        if (errno != EINTR)
-        {
-            throw std::runtime_error(errno_message("waitpid failed"));
-        }
-    }
+    result.diagnostic = read_pipe(output_read.get(), deadline);
+    output_read.reset();
+    const int status = child_process.wait_until(deadline);
     if (WIFEXITED(status))
     {
         result.exit_code = WEXITSTATUS(status);
     }
-
-    if (peer_error)
-    {
-        std::rethrow_exception(peer_error);
-    }
     return result;
+}
+
+struct ChildCleanupProbe
+{
+    bool child_ready = false;
+    bool wait_timed_out = false;
+    bool child_reaped = false;
+    long long elapsed_ms = 0;
+};
+
+ChildCleanupProbe child_scope_reaps_unresponsive_child()
+{
+    const std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+    int ready_pipe[2];
+    if (::pipe(ready_pipe) != 0)
+    {
+        throw std::runtime_error(errno_message("cleanup probe pipe failed"));
+    }
+    UniqueFd ready_read(ready_pipe[0]);
+    UniqueFd ready_write(ready_pipe[1]);
+
+    const pid_t child = ::fork();
+    if (child < 0)
+    {
+        throw std::runtime_error(errno_message("cleanup probe fork failed"));
+    }
+    if (child == 0)
+    {
+        ready_read.reset();
+        static_cast<void>(::signal(SIGTERM, SIG_IGN));
+        const char ready = 'R';
+        if (::write(ready_write.get(), &ready, 1) != 1)
+        {
+            ::_exit(3);
+        }
+        ready_write.reset();
+        while (true)
+        {
+            ::pause();
+        }
+    }
+
+    ChildCleanupProbe probe;
+    {
+        ChildProcess child_process(child);
+        ready_write.reset();
+        set_nonblocking(ready_read.get());
+        probe.child_ready = read_pipe(ready_read.get(), MonotonicDeadline(500)) == "R";
+        ready_read.reset();
+        const MonotonicDeadline deadline(50);
+        try
+        {
+            static_cast<void>(child_process.wait_until(deadline));
+        }
+        catch (const std::runtime_error& error)
+        {
+            probe.wait_timed_out = std::string(error.what()).find("timed out") != std::string::npos;
+        }
+    }
+
+    errno = 0;
+    int status = 0;
+    probe.child_reaped = (::waitpid(child, &status, WNOHANG) < 0 && errno == ECHILD);
+    probe.elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now() - started)
+                           .count();
+    return probe;
 }
 } // namespace
 
 TEST(SocketDriverTest, NonconvergedFrameIsNotPublished)
 {
-    const DriverResult result = run_driver_frame(false);
+    const DriverResult result = run_driver_frame(false, ChildMode::run_driver, DRIVER_DEADLINE_MS, nullptr);
 
     EXPECT_TRUE(result.response_header.empty()) << "unexpected response: " << result.response_header;
     EXPECT_EQ(1, result.exit_code);
@@ -412,8 +725,65 @@ TEST(SocketDriverTest, NonconvergedFrameIsNotPublished)
 
 TEST(SocketDriverTest, ConvergedFrameReachesHaveData)
 {
-    const DriverResult result = run_driver_frame(true);
+    const DriverResult result = run_driver_frame(true, ChildMode::run_driver, DRIVER_DEADLINE_MS, nullptr);
 
     EXPECT_EQ("HAVEDATA", result.response_header);
     EXPECT_EQ(0, result.exit_code);
+}
+
+TEST(SocketDriverTest, ChildOwnershipReapsUnresponsiveChild)
+{
+    const ChildCleanupProbe probe = child_scope_reaps_unresponsive_child();
+
+    EXPECT_TRUE(probe.child_ready);
+    EXPECT_TRUE(probe.wait_timed_out);
+    EXPECT_TRUE(probe.child_reaped);
+    EXPECT_LT(probe.elapsed_ms, 1000);
+}
+
+TEST(SocketDriverTest, ChildBeforeConnectTimesOutAndIsReaped)
+{
+    const std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+    pid_t child = -1;
+    bool accept_timed_out = false;
+
+    try
+    {
+        static_cast<void>(run_driver_frame(true, ChildMode::stall_before_connect, 50, &child));
+        FAIL() << "driver should time out when its child never connects";
+    }
+    catch (const std::runtime_error& error)
+    {
+        accept_timed_out = std::string(error.what()).find("socket accept timed out") != std::string::npos;
+    }
+
+    errno = 0;
+    int status = 0;
+    const bool child_reaped = child > 0 && ::waitpid(child, &status, WNOHANG) < 0 && errno == ECHILD;
+    const long long elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     std::chrono::steady_clock::now() - started)
+                                     .count();
+    EXPECT_TRUE(accept_timed_out);
+    EXPECT_TRUE(child_reaped);
+    EXPECT_LT(elapsed_ms, 1000);
+}
+
+TEST(SocketDriverTest, PipeDrainUsesMonotonicDeadline)
+{
+    int pipe_fds[2];
+    ASSERT_EQ(0, ::pipe(pipe_fds));
+    UniqueFd pipe_read(pipe_fds[0]);
+    UniqueFd pipe_write(pipe_fds[1]);
+    set_nonblocking(pipe_read.get());
+    const MonotonicDeadline deadline(50);
+
+    try
+    {
+        static_cast<void>(read_pipe(pipe_read.get(), deadline));
+        FAIL() << "pipe drain should time out while a silent writer remains open";
+    }
+    catch (const std::runtime_error& error)
+    {
+        EXPECT_THAT(error.what(), testing::HasSubstr("diagnostic pipe read timed out"));
+    }
 }

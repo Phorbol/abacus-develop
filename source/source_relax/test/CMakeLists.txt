@@ -24,6 +24,7 @@ AddTest(
           ../socket_driver.cpp
           ../socket_ipi.cpp
 )
+set_tests_properties(MODULE_RELAX_socket_driver_test PROPERTIES TIMEOUT 15)
 
 AddTest(
   TARGET MODULE_RELAX_relax_new_line_search
