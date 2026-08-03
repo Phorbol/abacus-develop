@@ -45,6 +45,10 @@ find_program(ABACUS_BASH_EXECUTABLE bash)
 if(NOT ABACUS_BASH_EXECUTABLE)
   message(FATAL_ERROR "bash is required for the socket driver MPI tests")
 endif()
+list(LENGTH MPIEXEC_NUMPROC_FLAG socket_mpi_numproc_flag_count)
+if(socket_mpi_numproc_flag_count GREATER 1)
+  message(FATAL_ERROR "MPIEXEC_NUMPROC_FLAG must contain at most one flag")
+endif()
 list(LENGTH MPIEXEC_PREFLAGS socket_mpi_preflags_count)
 list(LENGTH MPIEXEC_POSTFLAGS socket_mpi_postflags_count)
 add_test(
@@ -65,11 +69,12 @@ add_test(
     ${ABACUS_BASH_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/socket_driver_mpi_failure_test.sh
     ${MPIEXEC_EXECUTABLE}
-    ${MPIEXEC_NUMPROC_FLAG}
+    ${socket_mpi_numproc_flag_count}
     2
     $<TARGET_FILE:MODULE_RELAX_socket_driver_mpi_failure_test>
     ${socket_mpi_preflags_count}
     ${socket_mpi_postflags_count}
+    ${MPIEXEC_NUMPROC_FLAG}
     ${MPIEXEC_PREFLAGS}
     ${MPIEXEC_POSTFLAGS}
   WORKING_DIRECTORY $<TARGET_FILE_DIR:MODULE_RELAX_socket_driver_mpi_failure_test>
