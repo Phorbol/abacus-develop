@@ -7,6 +7,7 @@ binary64; validation uses eV/Angstrom units only as an independent outer check.
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import os
@@ -27,6 +28,16 @@ FD_LIMITS = {"rtol": 2.0e-2, "atol_ev_per_angstrom3": 5.0e-4}
 IDENTICAL_LIMITS = {"rtol": 2.0e-3, "atol_ev_per_angstrom3": 5.0e-5}
 DOUBLE_LIMITS = {"rtol": 1.0e-2, "atol_ev_per_angstrom3": 1.0e-4}
 SMOKE_LIMITS = {"rtol": 5.0e-2, "atol_ev_per_angstrom3": 2.0e-3}
+IDENTICAL_DOUBLE_LIMITS = {
+    "energy": {"rtol": 1.0e-8, "atol_ev": 1.0e-4},
+    "force_max": {"rtol": 1.0e-5, "atol_ev_per_angstrom": 1.0e-5},
+    "stress": IDENTICAL_LIMITS,
+}
+IDENTICAL_SMOKE_LIMITS = {
+    "energy": {"rtol": 5.0e-5, "atol_ev": 2.0e-3},
+    "force_max": {"rtol": 5.0e-2, "atol_ev_per_angstrom": 2.0e-3},
+    "stress": SMOKE_LIMITS,
+}
 VOLUME_LIMITS = {"rtol": 1.0e-10, "atol_angstrom3": 1.0e-8}
 FILTER_LIMITS = {
     "energy_rtol": 1.0e-8, "energy_atol_ev": 1.0e-7,
@@ -114,11 +125,14 @@ def finite_difference_scan(
     analytic_stress: Iterable[float],
     deltas: Iterable[float] = DELTAS,
     limits: dict = FD_LIMITS,
+    frames_required: bool = False,
 ) -> list[dict]:
     """Central six-strain derivative divided by the unstrained volume."""
     reference = np.asarray(tuple(analytic_stress), dtype=np.float64)
     if reference.shape != (6,) or not np.all(np.isfinite(reference)):
         raise AssertionError("analytic ASE stress must contain six finite values")
+    if type(frames_required) is not bool:
+        raise AssertionError("frames_required must be boolean")
     volume = float(atoms.get_volume())
     records = []
     for component, name in enumerate(VOIGT):
@@ -131,6 +145,9 @@ def finite_difference_scan(
                 plus_result, plus_frame = plus_result
             if isinstance(minus_result, tuple):
                 minus_result, minus_frame = minus_result
+            if frames_required and (plus_frame is None or minus_frame is None):
+                raise AssertionError(
+                    "real finite differences require complete plus/minus frames")
             plus, minus = float(plus_result), float(minus_result)
             if not np.isfinite(plus) or not np.isfinite(minus):
                 raise AssertionError("finite-difference energy is non-finite")
@@ -161,14 +178,28 @@ def finite_difference_scan(
             for i in range(len(points) - 1)
         )
         records.append({"component": name, "points": points,
+                        "frames_required": frames_required,
                         "passing_points": len(passed),
                         "plateau_pass": bool(adjacent_plateau)})
     return records
 
 
-def require_fd_plateau(records: list[dict]) -> None:
+def require_fd_plateau(records: list[dict], frames_required=None) -> None:
     if [record.get("component") for record in records] != list(VOIGT):
         raise AssertionError("finite-difference records use the wrong Voigt order")
+    if frames_required is not None:
+        if type(frames_required) is not bool:
+            raise AssertionError("finite-difference frame contract must be boolean")
+        for record in records:
+            if record.get("frames_required") is not frames_required:
+                raise AssertionError("finite-difference frame contract is inconsistent")
+            if frames_required:
+                for point in record.get("points", []):
+                    if "plus_frame" not in point or "minus_frame" not in point:
+                        raise AssertionError(
+                            "real finite-difference point lacks plus/minus frames")
+                    assert_real_frame_schema(point["plus_frame"])
+                    assert_real_frame_schema(point["minus_frame"])
     failed = [record["component"] for record in records
               if record.get("passing_points", 0) < 2
               or not record.get("plateau_pass", False)]
@@ -287,9 +318,17 @@ def assert_real_frame_schema(record: dict) -> None:
 def assert_json_schema(payload: dict) -> None:
     if payload.get("schema_version") != 1:
         raise AssertionError("unsupported or absent JSON schema version")
+    result_kind = payload.get("result_kind")
+    frames_required = payload.get("finite_difference_frames_required")
+    if result_kind not in ("real-validation", "analytic-self-test"):
+        raise AssertionError("result_kind must distinguish real and analytic output")
+    if (type(frames_required) is not bool
+            or frames_required != (result_kind == "real-validation")):
+        raise AssertionError("finite-difference frame requirement is inconsistent")
     for record in payload.get("frames", []):
         assert_real_frame_schema(record)
-    require_fd_plateau(payload["finite_difference"])
+    assert_identical_frame_schema(payload["identical_frame"])
+    require_fd_plateau(payload["finite_difference"], frames_required)
     for name in ("unit_cell_filter", "frechet_cell_filter"):
         result = payload["filters"][name]
         if result.get("accepted_steps", 0) < 3:
@@ -392,6 +431,109 @@ def _common_kwargs(config: Config) -> dict:
 
 def active_stress_limits(config: Config, reference_limits: dict) -> dict:
     return dict(reference_limits if config.precision == "double" else SMOKE_LIMITS)
+
+
+def active_identical_limits(config: Config) -> dict:
+    limits = (IDENTICAL_DOUBLE_LIMITS if config.precision == "double"
+              else IDENTICAL_SMOKE_LIMITS)
+    return copy.deepcopy(limits)
+
+
+def identical_frame_decision(
+        energy_error_ev: float, energy_reference_abs_ev: float,
+        force_error_ev_per_angstrom: float,
+        force_reference_max_abs_ev_per_angstrom: float,
+        stress_errors_ev_per_angstrom3,
+        stress_reference_abs_ev_per_angstrom3,
+        thresholds: dict) -> dict:
+    try:
+        energy_limits = thresholds["energy"]
+        force_limits = thresholds["force_max"]
+        stress_limits = thresholds["stress"]
+        threshold_values = (
+            energy_limits["atol_ev"], energy_limits["rtol"],
+            force_limits["atol_ev_per_angstrom"], force_limits["rtol"],
+            stress_limits["atol_ev_per_angstrom3"], stress_limits["rtol"])
+    except (KeyError, TypeError) as error:
+        raise AssertionError("identical-frame thresholds are incomplete") from error
+    scalars = (energy_error_ev, energy_reference_abs_ev,
+               force_error_ev_per_angstrom,
+               force_reference_max_abs_ev_per_angstrom) + threshold_values
+    if (any(isinstance(value, bool) or not np.isscalar(value)
+            or not np.isfinite(value) or value < 0.0 for value in scalars)):
+        raise AssertionError("identical-frame values must be finite and nonnegative")
+    stress_errors = np.asarray(stress_errors_ev_per_angstrom3, dtype=np.float64)
+    stress_reference = np.asarray(
+        stress_reference_abs_ev_per_angstrom3, dtype=np.float64)
+    if (stress_errors.shape != (6,) or stress_reference.shape != (6,)
+            or not np.all(np.isfinite(stress_errors))
+            or not np.all(np.isfinite(stress_reference))
+            or np.any(stress_errors < 0.0) or np.any(stress_reference < 0.0)):
+        raise AssertionError("identical-frame stress values must be six nonnegative values")
+    energy_tolerance = (energy_limits["atol_ev"]
+                        + energy_limits["rtol"] * energy_reference_abs_ev)
+    force_tolerance = (force_limits["atol_ev_per_angstrom"]
+                       + force_limits["rtol"]
+                       * force_reference_max_abs_ev_per_angstrom)
+    stress_tolerance = (stress_limits["atol_ev_per_angstrom3"]
+                        + stress_limits["rtol"] * stress_reference)
+    energy_pass = bool(energy_error_ev <= energy_tolerance)
+    force_pass = bool(force_error_ev_per_angstrom <= force_tolerance)
+    stress_pass = bool(np.all(stress_errors <= stress_tolerance))
+    return {
+        "energy_absolute_error_ev": float(energy_error_ev),
+        "energy_reference_abs_ev": float(energy_reference_abs_ev),
+        "force_max_absolute_error_ev_per_angstrom":
+            float(force_error_ev_per_angstrom),
+        "force_reference_max_abs_ev_per_angstrom":
+            float(force_reference_max_abs_ev_per_angstrom),
+        "stress_absolute_errors_ev_per_angstrom3": stress_errors.tolist(),
+        "stress_reference_abs_ev_per_angstrom3": stress_reference.tolist(),
+        "energy_atol_plus_rtol_ev": float(energy_tolerance),
+        "force_atol_plus_rtol_ev_per_angstrom": float(force_tolerance),
+        "stress_atol_plus_rtol_ev_per_angstrom3": stress_tolerance.tolist(),
+        "energy_pass": energy_pass, "force_pass": force_pass,
+        "stress_pass": stress_pass,
+        "pass": bool(energy_pass and force_pass and stress_pass),
+        "thresholds": copy.deepcopy(thresholds),
+    }
+
+
+def assert_identical_frame_schema(record: dict) -> None:
+    required = (
+        "energy_absolute_error_ev", "energy_reference_abs_ev",
+        "force_max_absolute_error_ev_per_angstrom",
+        "force_reference_max_abs_ev_per_angstrom",
+        "stress_absolute_errors_ev_per_angstrom3",
+        "stress_reference_abs_ev_per_angstrom3",
+        "energy_atol_plus_rtol_ev",
+        "force_atol_plus_rtol_ev_per_angstrom",
+        "stress_atol_plus_rtol_ev_per_angstrom3",
+        "energy_pass", "force_pass", "stress_pass", "pass", "thresholds",
+        "is_reference")
+    missing = [key for key in required if key not in record]
+    if missing:
+        raise AssertionError("identical-frame JSON is missing: " + ",".join(missing))
+    replay = identical_frame_decision(
+        record["energy_absolute_error_ev"], record["energy_reference_abs_ev"],
+        record["force_max_absolute_error_ev_per_angstrom"],
+        record["force_reference_max_abs_ev_per_angstrom"],
+        record["stress_absolute_errors_ev_per_angstrom3"],
+        record["stress_reference_abs_ev_per_angstrom3"], record["thresholds"])
+    for key in ("energy_atol_plus_rtol_ev",
+                "force_atol_plus_rtol_ev_per_angstrom"):
+        if not np.isclose(record[key], replay[key], rtol=0.0, atol=1.0e-15):
+            raise AssertionError("identical-frame recorded tolerance is stale")
+    if not np.allclose(
+            record["stress_atol_plus_rtol_ev_per_angstrom3"],
+            replay["stress_atol_plus_rtol_ev_per_angstrom3"],
+            rtol=0.0, atol=1.0e-15):
+        raise AssertionError("identical-frame stress tolerances are stale")
+    for key in ("energy_pass", "force_pass", "stress_pass", "pass"):
+        if type(record[key]) is not bool or record[key] != replay[key]:
+            raise AssertionError("identical-frame decision cannot be replayed")
+    if type(record["is_reference"]) is not bool:
+        raise AssertionError("identical-frame is_reference must be boolean")
 
 
 def _load_abacus_api():
@@ -773,7 +915,8 @@ def run_validation(config: Config) -> dict:
             return energy, frame
         finite_difference = finite_difference_scan(
             socket_atoms, socket_energy, socket_stress,
-            limits=active_stress_limits(config, FD_LIMITS))
+            limits=active_stress_limits(config, FD_LIMITS),
+            frames_required=True)
     require_fd_plateau(finite_difference)
     energy_error = abs(socket_record["energy_ev"] - file_record["energy_ev"])
     force_error = float(np.max(np.abs(
@@ -781,20 +924,13 @@ def run_validation(config: Config) -> dict:
         - np.asarray(file_record["forces_ev_per_angstrom"]))))
     stress_error = np.abs(np.asarray(socket_record["ase_stress_ev_per_angstrom3"])
                           - np.asarray(file_record["ase_stress_ev_per_angstrom3"]))
-    identical_limits = active_stress_limits(config, IDENTICAL_LIMITS)
-    stress_tolerance = (identical_limits["atol_ev_per_angstrom3"]
-                        + identical_limits["rtol"] * np.abs(
-                            np.asarray(file_record["ase_stress_ev_per_angstrom3"])))
-    identical = {
-        "energy_absolute_error_ev": energy_error,
-        "force_max_absolute_error_ev_per_angstrom": force_error,
-        "stress_absolute_errors_ev_per_angstrom3": stress_error.tolist(),
-        "stress_atol_plus_rtol": stress_tolerance.tolist(),
-        "pass": bool(energy_error <= 1.0e-4 and force_error <= 1.0e-5
-                     and np.all(stress_error <= stress_tolerance)),
-        "thresholds": identical_limits,
-        "is_reference": config.precision == "double",
-    }
+    file_forces = np.asarray(file_record["forces_ev_per_angstrom"])
+    file_stress = np.asarray(file_record["ase_stress_ev_per_angstrom3"])
+    identical = identical_frame_decision(
+        energy_error, abs(file_record["energy_ev"]), force_error,
+        float(np.max(np.abs(file_forces))), stress_error,
+        np.abs(file_stress), active_identical_limits(config))
+    identical["is_reference"] = config.precision == "double"
     if not identical["pass"]:
         raise AssertionError("identical-frame FileIO/socket comparison failed")
     shear = [record for record in finite_difference
@@ -804,7 +940,9 @@ def run_validation(config: Config) -> dict:
                for record in shear):
         raise AssertionError("no nonzero finite-difference-consistent shear response")
     payload = {
-        "schema_version": 1, "voigt_order": list(VOIGT),
+        "schema_version": 1, "result_kind": "real-validation",
+        "finite_difference_frames_required": True,
+        "voigt_order": list(VOIGT),
         "shear_deformation": "symmetric gamma/2",
         "finite_difference_deltas": list(DELTAS),
         "frames": [file_record, socket_record],
@@ -962,7 +1100,15 @@ def _analytic_self_test() -> None:
             pass
         else:
             raise AssertionError(label + " prepare manifest was accepted")
-    payload = {"schema_version": 1, "frames": [frame],
+    analytic_identical = identical_frame_decision(
+        0.0, 0.0, 0.0, 0.0, np.zeros(6), np.zeros(6),
+        copy.deepcopy(IDENTICAL_DOUBLE_LIMITS))
+    analytic_identical["is_reference"] = True
+    payload = {"schema_version": 1,
+               "result_kind": "analytic-self-test",
+               "finite_difference_frames_required": False,
+               "frames": [frame],
+               "identical_frame": analytic_identical,
                "finite_difference": records,
                "filters": {
                    "unit_cell_filter": {"accepted_steps": 3,
@@ -974,6 +1120,68 @@ def _analytic_self_test() -> None:
                                            "energy_decreased": True,
                                            "stress_decreased": True}}}
     assert_json_schema(payload)
+    missing_identical_thresholds = json.loads(json.dumps(payload))
+    missing_identical_thresholds["identical_frame"] = {"pass": True}
+    try:
+        assert_json_schema(missing_identical_thresholds)
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("missing identical-frame thresholds were accepted")
+    replay_errors = np.full(6, 5.0e-4)
+    double_decision = identical_frame_decision(
+        5.0e-4, 0.0, 5.0e-4, 0.0, replay_errors, np.zeros(6),
+        copy.deepcopy(IDENTICAL_DOUBLE_LIMITS))
+    smoke_decision = identical_frame_decision(
+        5.0e-4, 0.0, 5.0e-4, 0.0, replay_errors, np.zeros(6),
+        copy.deepcopy(IDENTICAL_SMOKE_LIMITS))
+    assert not double_decision["pass"] and smoke_decision["pass"]
+    tight_limits = copy.deepcopy(IDENTICAL_SMOKE_LIMITS)
+    tight_limits["energy"].update({"atol_ev": 1.0e-6, "rtol": 0.0})
+    assert not identical_frame_decision(
+        5.0e-4, 0.0, 5.0e-4, 0.0, replay_errors, np.zeros(6),
+        tight_limits)["pass"]
+    assert not identical_frame_decision(
+        1.0e-2, 0.0, 1.0e-2, 0.0, np.full(6, 1.0e-2), np.zeros(6),
+        copy.deepcopy(IDENTICAL_SMOKE_LIMITS))["pass"]
+    stale_threshold_decision = copy.deepcopy(smoke_decision)
+    stale_threshold_decision["is_reference"] = False
+    stale_threshold_decision["thresholds"]["stress"][
+        "atol_ev_per_angstrom3"] = 1.0e-6
+    try:
+        assert_identical_frame_schema(stale_threshold_decision)
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("stale identical-frame threshold replay was accepted")
+    real_fd_without_frames = copy.deepcopy(payload)
+    real_fd_without_frames["result_kind"] = "real-validation"
+    real_fd_without_frames["finite_difference_frames_required"] = True
+    for record in real_fd_without_frames["finite_difference"]:
+        record["frames_required"] = True
+    try:
+        assert_json_schema(real_fd_without_frames)
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("real finite differences without frames were accepted")
+    complete_real_fd = copy.deepcopy(payload)
+    complete_real_fd["result_kind"] = "real-validation"
+    complete_real_fd["finite_difference_frames_required"] = True
+    for record in complete_real_fd["finite_difference"]:
+        record["frames_required"] = True
+        for point in record["points"]:
+            point["plus_frame"] = copy.deepcopy(frame)
+            point["minus_frame"] = copy.deepcopy(frame)
+    assert_json_schema(complete_real_fd)
+    single_missing_fd = copy.deepcopy(complete_real_fd)
+    del single_missing_fd["finite_difference"][0]["points"][0]["minus_frame"]
+    try:
+        assert_json_schema(single_missing_fd)
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("single missing finite-difference frame was accepted")
     del frame["raw_abacus_stress_kbar"]
     try:
         assert_json_schema(payload)

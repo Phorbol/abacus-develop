@@ -148,22 +148,29 @@ def unlink_owned_socket(socket_name: str) -> None:
         pass
 
 
-def parse_properties(path: Path, expected_steps: int) -> dict:
+def parse_properties(path: Path, completed_steps: int) -> dict:
     """Parse official six-component cell_h/virial_md plus two-atom forces."""
+    if (isinstance(completed_steps, bool) or not isinstance(completed_steps, int)
+            or completed_steps < 0):
+        raise AssertionError("completed i-PI step count must be a nonnegative integer")
     if not path.is_file():
         raise AssertionError("i-PI properties output is absent: {}".format(path))
     rows = []
-    for line in path.read_text().splitlines():
+    for line_number, line in enumerate(path.read_text().splitlines(), start=1):
         if not line.strip() or line.lstrip().startswith("#"):
             continue
         try:
             values = [float(value) for value in line.split()]
-        except ValueError:
-            continue
+        except ValueError as error:
+            raise AssertionError(
+                "non-numeric i-PI properties row {}".format(line_number)) from error
         if len(values) != 22:
             raise AssertionError("i-PI properties row lacks cell/virial columns")
         if not np.all(np.isfinite(values)):
             raise AssertionError("i-PI properties contain non-finite values")
+        if not values[0].is_integer():
+            raise AssertionError("i-PI property step must be an integer")
+        step = int(values[0])
         forces = np.asarray(values[3:9], dtype=np.float64).reshape(2, 3)
         volume = values[9]
         cell6 = np.asarray(values[10:16], dtype=np.float64)
@@ -186,17 +193,21 @@ def parse_properties(path: Path, expected_steps: int) -> dict:
         if volume <= 0.0 or abs(volume - determinant) > volume_tolerance:
             raise AssertionError("i-PI volume disagrees with det(cell_h)")
         rows.append({
-            "step": int(round(values[0])), "potential_ev": values[1],
+            "step": step, "potential_ev": values[1],
             "conserved_ev": values[2], "forces_ev_per_angstrom": forces.tolist(),
             "volume_bohr3": volume,
             "cell_bohr": cell.tolist(), "condition_number": condition,
             "virial_pressure_hartree_per_bohr3": virial_pressure.tolist(),
             "virial_hartree": (virial_pressure * volume).tolist(),
         })
-    if len(rows) != expected_steps:
-        raise AssertionError("{} rather than exactly {} i-PI steps parsed".format(
-            len(rows), expected_steps))
-    return {"steps": rows, "completed_steps": len(rows),
+    expected_sequence = list(range(completed_steps + 1))
+    actual_sequence = [row["step"] for row in rows]
+    if actual_sequence != expected_sequence:
+        raise AssertionError(
+            "i-PI property steps must be exactly 0..{}; got {}".format(
+                completed_steps, actual_sequence))
+    return {"steps": rows, "completed_steps": completed_steps,
+            "sample_count": len(rows), "includes_initial_frame": True,
             "volume_sequence_bohr3": [row["volume_bohr3"] for row in rows]}
 
 
@@ -205,15 +216,28 @@ def paired_pressure_decision(low: dict, high: dict) -> dict:
     high_target = float(high["target_pressure_gpa"])
     low_volumes = np.asarray(low["volume_sequence_bohr3"], dtype=np.float64)
     high_volumes = np.asarray(high["volume_sequence_bohr3"], dtype=np.float64)
-    if low_volumes.size < 5 or high_volumes.size < 5:
-        raise AssertionError("paired pressure probe requires five steps per replica")
-    scale = max(abs(low_volumes[-1]), abs(high_volumes[-1]))
+    for replica in (low, high):
+        if (replica.get("completed_steps") != 5
+                or replica.get("sample_count") != 6
+                or replica.get("includes_initial_frame") is not True):
+            raise AssertionError(
+                "paired pressure probe requires initial frame plus five MD steps")
+    if low_volumes.shape != (6,) or high_volumes.shape != (6,):
+        raise AssertionError("paired pressure probe requires exactly six samples")
+    if not np.all(np.isfinite(low_volumes)) or not np.all(np.isfinite(high_volumes)):
+        raise AssertionError("paired pressure volumes must be finite")
+    scale = max(float(np.max(np.abs(low_volumes))),
+                float(np.max(np.abs(high_volumes))))
     tolerance = (PRESSURE_DIRECTION_LIMITS["atol_bohr3"]
                  + PRESSURE_DIRECTION_LIMITS["rtol"] * scale)
     differences = high_volumes - low_volumes
-    trend = float(np.mean(differences[-2:]) - np.mean(differences[:2]))
+    changes_from_initial = differences - differences[0]
+    trend = float(np.mean(changes_from_initial[-2:])
+                  - np.mean(changes_from_initial[:2]))
     passed = bool(high_target > low_target
-                  and differences[-1] < -tolerance and trend < -tolerance)
+                  and abs(differences[0]) <= tolerance
+                  and changes_from_initial[-1] < -tolerance
+                  and trend < -tolerance)
     result = {
         "low_target_pressure_gpa": low_target,
         "high_target_pressure_gpa": high_target,
@@ -221,7 +245,15 @@ def paired_pressure_decision(low: dict, high: dict) -> dict:
         "high_volume_sequence_bohr3": high_volumes.tolist(),
         "higher_pressure_has_smaller_final_volume": passed,
         "paired_high_minus_low_volume_bohr3": differences.tolist(),
-        "trend_last_minus_first_bohr3": trend,
+        "paired_high_minus_low_change_from_initial_bohr3":
+            changes_from_initial.tolist(),
+        "initial_high_minus_low_volume_bohr3": float(differences[0]),
+        "final_high_minus_low_change_from_initial_bohr3":
+            float(changes_from_initial[-1]),
+        "trend_last_two_minus_first_two_change_from_initial_bohr3": trend,
+        "comparison_basis": (
+            "six samples: shared initial frame plus five completed MD steps; "
+            "final and trend are high-minus-low changes relative to sample 0"),
         "atol_plus_rtol_bohr3": tolerance,
         "thresholds": PRESSURE_DIRECTION_LIMITS,
     }
@@ -293,6 +325,8 @@ def enrich_ipi_frames(parsed: dict, raw_frames: list,
             "condition_number": float(np.linalg.cond(cell_bohr, 2)),
             "scf_converged": raw_frame["scf_converged"],
             "energy_ev": row["potential_ev"],
+            "ipi_property_step": row["step"],
+            "is_initial_frame": row["step"] == 0,
             "atom_count": len(row["forces_ev_per_angstrom"]),
             "forces_ev_per_angstrom": row["forces_ev_per_angstrom"],
             "raw_abacus_stress_kbar": raw_stress,
@@ -472,7 +506,7 @@ def run_instance(config: ase_validation.Config, mode: str, run_dir: Path,
     parsed = parse_properties(run_dir / (prefix + ".properties"), steps)
     stability = evaluate_ipi_stability(
         parsed, mode, run_dir / (prefix + ".checkpoint"))
-    raw_frames = ase_validation.raw_frame_series(abacus_dir, len(parsed["steps"]))
+    raw_frames = ase_validation.raw_frame_series(abacus_dir, parsed["sample_count"])
     enrich_ipi_frames(parsed, raw_frames, ase_validation._identity(config), config)
     parsed.update({
         "mode": mode, "target_pressure_gpa": float(pressure_gpa),
@@ -529,6 +563,7 @@ def run_validation(config: ase_validation.Config, mode: str, steps: int) -> dict
 
 def _self_test() -> None:
     import ipi
+    from ipi.engine.simulation import Simulation
     assert ipi.__version__ == IPI_VERSION
     with tempfile.TemporaryDirectory(prefix="task7-ipi-selftest-") as temporary:
         directory = Path(temporary)
@@ -546,12 +581,39 @@ def _self_test() -> None:
             assert np.all(np.asarray(system.motion.barostat.p) == 0.0)
             if mode == "flexible":
                 assert type(system.motion.barostat).__name__ == "BaroMTK"
+        official_samples = []
+        official_md_steps = []
+        class DummyCheckpoint:
+            def store(self):
+                pass
+        class DummyOutput:
+            def active(self):
+                return True
+            def write(self):
+                official_samples.append(dummy_simulation.step + 1)
+        class DummySimulation:
+            step = 0
+            tsteps = 5
+            threading = False
+            safe_stride = 1000
+            ttime = 0
+            rollback = True
+            chk = DummyCheckpoint()
+            outputs = [DummyOutput()]
+            def run_step(self, step):
+                official_md_steps.append(step)
+        dummy_simulation = DummySimulation()
+        Simulation.run(dummy_simulation)
+        assert official_samples == list(range(6))
+        assert official_md_steps == list(range(5))
+        print("official i-PI output semantics probe: "
+              "5 completed MD steps -> property samples 0..5")
         properties = directory / "synthetic.properties"
         forces = [0.1, 0.2, 0.3, -0.1, -0.2, -0.3]
         base_cell6 = np.array([5.43, 5.21, 5.57, 0.31, 0.17, 0.37])
         base_virial6 = np.array([1.0, 1.1, 1.2, 0.1, 0.2, 0.3])
         lines = ["# step potential conserved forces volume cell_h virial_md"]
-        for step in range(5):
+        for step in range(6):
             cell6 = base_cell6.copy()
             cell6[:3] *= 1.0 - 1.0e-4 * step
             cell6[3:] += step * np.array([2.0e-4, -1.0e-4, 3.0e-4])
@@ -563,6 +625,39 @@ def _self_test() -> None:
         properties.write_text("\n".join(lines) + "\n")
         parsed = parse_properties(properties, 5)
         assert parsed["completed_steps"] == 5
+        assert parsed["sample_count"] == 6
+        assert parsed["includes_initial_frame"] is True
+        assert [row["step"] for row in parsed["steps"]] == list(range(6))
+        def reject_properties(label, mutated_lines):
+            mutated = directory / (label + ".properties")
+            mutated.write_text("\n".join(mutated_lines) + "\n")
+            try:
+                parse_properties(mutated, 5)
+            except AssertionError:
+                pass
+            else:
+                raise AssertionError(label + " properties mutation was accepted")
+        reject_properties("n-lines", lines[:-1])
+        extra_lines = list(lines)
+        extra_values = extra_lines[-1].split()
+        extra_values[0] = "6"
+        extra_lines.append(" ".join(extra_values))
+        reject_properties("n-plus-two-lines", extra_lines)
+        reject_properties("garbage-line", lines + ["not numeric property data"])
+        duplicate_lines = list(lines)
+        duplicate_values = duplicate_lines[3].split()
+        duplicate_values[0] = "1"
+        duplicate_lines[3] = " ".join(duplicate_values)
+        reject_properties("duplicate-step", duplicate_lines)
+        noninteger_lines = list(lines)
+        noninteger_values = noninteger_lines[3].split()
+        noninteger_values[0] = "1.5"
+        noninteger_lines[3] = " ".join(noninteger_values)
+        reject_properties("noninteger-step", noninteger_lines)
+        out_of_order_lines = list(lines)
+        out_of_order_lines[2], out_of_order_lines[3] = (
+            out_of_order_lines[3], out_of_order_lines[2])
+        reject_properties("out-of-order-step", out_of_order_lines)
         assert parsed["steps"][0]["cell_bohr"] == [
             [5.43, 0.31, 0.17], [0.0, 5.21, 0.37], [0.0, 0.0, 5.57]]
         checkpoint = directory / "synthetic.checkpoint"
@@ -593,10 +688,12 @@ def _self_test() -> None:
         first = parsed["steps"][0]
         assert np.asarray(first["ase_stress_ev_per_angstrom3"]).shape == (6,)
         assert first["precision_settings"]["socket_float"] == "IEEE-754 binary64"
-        low = {"target_pressure_gpa": -1.0,
-               "volume_sequence_bohr3": [150, 151, 152, 153, 154]}
-        high = {"target_pressure_gpa": 3.0,
-                "volume_sequence_bohr3": [150, 149, 148, 147, 146]}
+        probe_metadata = {"completed_steps": 5, "sample_count": 6,
+                          "includes_initial_frame": True}
+        low = dict(probe_metadata, target_pressure_gpa=-1.0,
+                   volume_sequence_bohr3=[150, 151, 152, 153, 154, 155])
+        high = dict(probe_metadata, target_pressure_gpa=3.0,
+                    volume_sequence_bohr3=[150, 149, 148, 147, 146, 145])
         assert paired_pressure_decision(low, high)[
             "higher_pressure_has_smaller_final_volume"]
         smoke_significance = pressure_offset_significance(
@@ -609,19 +706,20 @@ def _self_test() -> None:
             pass
         else:
             raise AssertionError("pressure offset below single smoke noise was accepted")
-        wrong = {"target_pressure_gpa": 3.0,
-                 "volume_sequence_bohr3": [150, 151, 152, 153, 154]}
+        wrong = dict(probe_metadata, target_pressure_gpa=3.0,
+                     volume_sequence_bohr3=[150, 151, 152, 153, 154, 155])
         try:
             paired_pressure_decision(low, wrong)
         except AssertionError:
             pass
         else:
             raise AssertionError("wrong pressure/volume direction was accepted")
-        insignificant = {
-            "target_pressure_gpa": 3.0,
-            "volume_sequence_bohr3": [150, 150, 150, 150, 150 - 1.0e-13]}
-        low_flat = {"target_pressure_gpa": -1.0,
-                    "volume_sequence_bohr3": [150, 150, 150, 150, 150]}
+        insignificant = dict(
+            probe_metadata, target_pressure_gpa=3.0,
+            volume_sequence_bohr3=[150, 150, 150, 150, 150, 150 - 1.0e-13])
+        low_flat = dict(
+            probe_metadata, target_pressure_gpa=-1.0,
+            volume_sequence_bohr3=[150, 150, 150, 150, 150, 150])
         try:
             paired_pressure_decision(low_flat, insignificant)
         except AssertionError:
@@ -633,9 +731,9 @@ def _self_test() -> None:
         logdir.mkdir(parents=True)
         log = logdir / "running_scf.log"
         block = "#SCF IS CONVERGED#\nTOTAL-STRESS (KBAR)\n1 0 0\n0 1 0\n0 0 1\n"
-        log.write_text(block * 5)
-        assert len(ase_validation.raw_frame_series(logdir.parent, 5)) == 5
-        for count in (4, 6):
+        log.write_text(block * 6)
+        assert len(ase_validation.raw_frame_series(logdir.parent, 6)) == 6
+        for count in (5, 7):
             try:
                 ase_validation.raw_frame_series(logdir.parent, count)
             except AssertionError:

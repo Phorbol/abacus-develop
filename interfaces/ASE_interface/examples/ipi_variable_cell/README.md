@@ -17,9 +17,17 @@ ABACUS_BIN=$(command -v abacus)
 abacus --version
 ```
 
-For later real Task 9/10 runs, replace `ABACUS_BIN` with the staged executable
-built from this feature branch. Install the pinned upstream i-PI tag into the
-existing validation environment:
+For later real Task 9/10 runs, use the exact Task 8 shared runtime paths below,
+which contain the staged executables built from this feature branch:
+
+```text
+/home/gengjianrui/bin/abacus-variable-cell-runtime/bin/abacus_basic_para
+/home/gengjianrui/bin/abacus-variable-cell-runtime/bin/abacus_basic_gpu
+/home/gengjianrui/bin/abacus-variable-cell-runtime/PP_ORB
+/home/gengjianrui/bin/abacus-variable-cell-runtime/venv/bin/python
+```
+
+Install the pinned upstream i-PI tag into the existing validation environment:
 
 ```bash
 /tmp/abacus-variable-cell-venv/bin/pip install \
@@ -51,24 +59,33 @@ backend/device/precision settings, and official i-PI parser metadata.
 Real acceptance examples:
 
 ```bash
-OMP_NUM_THREADS=1 python ../socketio_variable_cell.py --basis pw --device cpu \
-  --precision double --abacus "mpirun -np 4 /path/to/abacus" \
-  --pp-orb-root /staged/PP_ORB --workdir ase-pw-cpu
-OMP_NUM_THREADS=1 python ../socketio_variable_cell.py --basis lcao --device cpu \
-  --precision double --abacus "mpirun -np 4 /path/to/abacus" \
-  --pp-orb-root /staged/PP_ORB --workdir ase-lcao-cpu
-OMP_NUM_THREADS=1 python ../socketio_variable_cell.py --basis pw --device gpu \
-  --precision double --abacus "mpirun -np 4 /path/to/abacus" \
-  --pp-orb-root /staged/PP_ORB --workdir ase-pw-gpu
-OMP_NUM_THREADS=1 python run_validation.py --basis lcao --device gpu \
-  --precision double --mode flexible --steps 50 \
-  --abacus "mpirun -np 4 /path/to/abacus" \
-  --pp-orb-root /staged/PP_ORB --workdir ipi-lcao-gpu
+OMP_NUM_THREADS=1 /home/gengjianrui/bin/abacus-variable-cell-runtime/venv/bin/python \
+  ../socketio_variable_cell.py --basis pw --device cpu --precision double \
+  --abacus "mpirun -np 4 /home/gengjianrui/bin/abacus-variable-cell-runtime/bin/abacus_basic_para" \
+  --pp-orb-root /home/gengjianrui/bin/abacus-variable-cell-runtime/PP_ORB \
+  --workdir ase-pw-cpu
+OMP_NUM_THREADS=1 /home/gengjianrui/bin/abacus-variable-cell-runtime/venv/bin/python \
+  ../socketio_variable_cell.py --basis lcao --device cpu --precision double \
+  --abacus "mpirun -np 4 /home/gengjianrui/bin/abacus-variable-cell-runtime/bin/abacus_basic_para" \
+  --pp-orb-root /home/gengjianrui/bin/abacus-variable-cell-runtime/PP_ORB \
+  --workdir ase-lcao-cpu
+OMP_NUM_THREADS=1 /home/gengjianrui/bin/abacus-variable-cell-runtime/venv/bin/python \
+  ../socketio_variable_cell.py --basis pw --device gpu --precision double \
+  --abacus "mpirun -np 4 /home/gengjianrui/bin/abacus-variable-cell-runtime/bin/abacus_basic_gpu" \
+  --pp-orb-root /home/gengjianrui/bin/abacus-variable-cell-runtime/PP_ORB \
+  --workdir ase-pw-gpu
+OMP_NUM_THREADS=1 /home/gengjianrui/bin/abacus-variable-cell-runtime/venv/bin/python \
+  run_validation.py --basis lcao --device gpu --precision double \
+  --mode flexible --steps 50 \
+  --abacus "mpirun -np 4 /home/gengjianrui/bin/abacus-variable-cell-runtime/bin/abacus_basic_gpu" \
+  --pp-orb-root /home/gengjianrui/bin/abacus-variable-cell-runtime/PP_ORB \
+  --workdir ipi-lcao-gpu
 ```
 
 Every real runner first obtains hydrostatic pressure from an ABACUS FileIO
 reference, then runs two identical five-step isotropic replicas at
-`p_initial - 2 GPa` and `p_initial + 2 GPa`. The higher-pressure replica
+`p_initial - 2 GPa` and `p_initial + 2 GPa`. Each replica records the initial
+sample at step 0 plus five completed MD steps, for six samples total. The higher-pressure replica
 must finish at smaller volume. This barostat-direction check complements, but
 does not replace, the ASE validator's six central finite differences at
 `1e-4`, `3e-4`, and `1e-3`.
