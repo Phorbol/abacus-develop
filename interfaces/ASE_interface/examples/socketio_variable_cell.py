@@ -82,6 +82,32 @@ def displaced_triclinic_si2():
     )
 
 
+def stable_filter_diamond_si8():
+    """The stable full-cell ASE-filter fixture proven by the Task 9f run."""
+    from ase import Atoms
+    cell = np.array([
+        [5.46258, 0.01629, -0.01086],
+        [0.01629, 5.40285, 0.013575],
+        [-0.01086, 0.013575, 5.42457],
+    ], dtype=np.float64)
+    fractional_positions = np.array([
+        [0.0, 0.0, 0.0],
+        [0.25, 0.25, 0.25],
+        [0.0, 0.5, 0.5],
+        [0.25, 0.75, 0.75],
+        [0.5, 0.0, 0.5],
+        [0.75, 0.25, 0.75],
+        [0.5, 0.5, 0.0],
+        [0.75, 0.75, 0.25],
+    ], dtype=np.float64)
+    return Atoms(
+        ["Si"] * 8,
+        scaled_positions=fractional_positions,
+        cell=cell,
+        pbc=True,
+    )
+
+
 def deformation_matrix(component: int, amount: float) -> np.ndarray:
     """Return F; Voigt shear uses gamma/2 in both symmetric entries."""
     if component not in range(6) or not np.isfinite(amount):
@@ -887,7 +913,7 @@ def _filter_run(config: Config, filter_name: str, directory: Path) -> dict:
     from ase.optimize import BFGS
     AbacusSocketIO = _recording_socket_class()
     shutil.rmtree(directory, ignore_errors=True)
-    atoms = displaced_triclinic_si2()
+    atoms = stable_filter_diamond_si8()
     calc = AbacusSocketIO(profile=_profile(config), directory=directory,
                           unixsocket="task7_{}_{}".format(filter_name, os.getpid()),
                           timeout=300, variable_cell=True, **_common_kwargs(config))
@@ -1138,6 +1164,104 @@ def _analytic_self_test() -> None:
     print("source commit provenance probe: checkout/staged exact 40-hex PASS; "
           "strict marker and lexical Git/symlink collisions rejected")
     atoms = displaced_triclinic_si2()
+    filter_fixture_factory = globals().get("stable_filter_diamond_si8")
+    if not callable(filter_fixture_factory):
+        raise AssertionError("dedicated stable diamond-Si8 filter fixture is missing")
+    filter_atoms = filter_fixture_factory()
+    expected_filter_cell = np.array([
+        [5.46258, 0.01629, -0.01086],
+        [0.01629, 5.40285, 0.013575],
+        [-0.01086, 0.013575, 5.42457],
+    ], dtype=np.float64)
+    expected_filter_fractions = np.array([
+        [0.0, 0.0, 0.0],
+        [0.25, 0.25, 0.25],
+        [0.0, 0.5, 0.5],
+        [0.25, 0.75, 0.75],
+        [0.5, 0.0, 0.5],
+        [0.75, 0.25, 0.75],
+        [0.5, 0.5, 0.0],
+        [0.75, 0.75, 0.25],
+    ], dtype=np.float64)
+    if (filter_atoms.get_chemical_symbols() != ["Si"] * 8
+            or not np.all(filter_atoms.pbc)
+            or filter_atoms.cell.array.dtype != np.float64
+            or filter_atoms.positions.dtype != np.float64
+            or not np.array_equal(filter_atoms.cell.array, expected_filter_cell)
+            or not np.array_equal(
+                filter_atoms.positions,
+                expected_filter_fractions @ expected_filter_cell)
+            or not np.allclose(
+                filter_atoms.get_scaled_positions(wrap=False),
+                expected_filter_fractions, rtol=0.0, atol=4.0e-16)):
+        raise AssertionError("stable filter fixture identity/cell/positions changed")
+    filter_volume = float(filter_atoms.get_volume())
+    filter_condition = float(np.linalg.cond(filter_atoms.cell.array, 2))
+    filter_density = (float(np.sum(filter_atoms.get_masses()))
+                      * units._amu * 1.0e27 / filter_volume)
+    filter_distances = filter_atoms.get_all_distances(mic=True)
+    np.fill_diagonal(filter_distances, np.inf)
+    filter_mic_distance = float(np.min(filter_distances))
+    filter_shears = filter_atoms.cell.array[[0, 0, 1], [1, 2, 2]]
+    if (not 160.09 < filter_volume < 160.10
+            or not 1.0 < filter_condition < 2.0
+            or not 2.32 < filter_density < 2.34
+            or not 2.33 < filter_mic_distance < 2.35
+            or not np.all(filter_shears != 0.0)
+            or len(set(filter_shears.tolist())) != 3):
+        raise AssertionError("stable filter fixture physical invariants changed")
+
+    class FilterFixtureObserved(Exception):
+        pass
+
+    class ProbeCalculator:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, _exception_type, _exception, _traceback):
+            return False
+
+    def observe_filter_fixture(observed_atoms):
+        if (observed_atoms.get_chemical_symbols() != ["Si"] * 8
+                or not np.array_equal(
+                    observed_atoms.cell.array, expected_filter_cell)
+                or not np.array_equal(
+                    observed_atoms.positions, filter_atoms.positions)):
+            raise AssertionError(
+                "filter runner did not use stable diamond-Si8 fixture")
+        raise FilterFixtureObserved
+
+    import ase.filters
+    current_module = sys.modules[__name__]
+    probe_config = Config(
+        abacus="unused", basis="pw", device="cpu", precision="double",
+        workdir=Path("unused"), output=Path("unused"),
+        pp_orb_root=Path("unused"))
+    with tempfile.TemporaryDirectory(
+            prefix="task9g-filter-fixture-selftest-") as temporary:
+        try:
+            with patch.object(
+                    current_module, "_recording_socket_class",
+                    return_value=ProbeCalculator), patch.object(
+                        current_module, "_profile", return_value=object()), \
+                    patch.object(
+                        current_module, "_common_kwargs", return_value={}), \
+                    patch.object(
+                        current_module, "_identity", return_value={}), \
+                    patch.object(
+                        ase.filters, "UnitCellFilter",
+                        new=observe_filter_fixture):
+                _filter_run(
+                    probe_config, "unit_cell_filter",
+                    Path(temporary) / "filter-run")
+        except FilterFixtureObserved:
+            pass
+        else:
+            raise AssertionError(
+                "filter runner did not reach stable diamond-Si8 fixture")
     base_cell = atoms.cell.array.copy()
     volume = atoms.get_volume()
     reference_strain = np.array([0.02, -0.015, 0.01, 0.012, -0.009, 0.017])
