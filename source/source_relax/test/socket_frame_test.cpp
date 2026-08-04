@@ -66,6 +66,38 @@ TEST(SocketFrameTest, RightHandedTriclinicCellReturnsKnownInverse)
     expect_matrix_near(inverse, out.computed_inverse_wire_bohr_inv, 16.0 * EPSILON);
 }
 
+TEST(SocketFrameTest, AseTriclinicInverseWireLayoutIsAcceptedAndRecomputedFromCell)
+{
+    // ASE stores row lattice vectors A in Angstrom, sends H = A^T / Bohr,
+    // and sends pinv(A) * Bohr as the inverse field. For this nonsingular
+    // cell that received field is inv(H)^T, not inv(H).
+    const double bohr_angstrom = 0.5291772105638411;
+    const Matrix9 cell_wire = {{5.0 / bohr_angstrom, 0.5 / bohr_angstrom, 0.25 / bohr_angstrom,
+                                0.0, 4.0 / bohr_angstrom, 0.75 / bohr_angstrom,
+                                0.0, 0.0, 3.0 / bohr_angstrom}};
+    const Matrix9 ase_inverse_wire = {{bohr_angstrom / 5.0, 0.0, 0.0,
+                                       -bohr_angstrom / 40.0, bohr_angstrom / 4.0, 0.0,
+                                       -bohr_angstrom / 96.0, -bohr_angstrom / 16.0,
+                                       bohr_angstrom / 3.0}};
+    const Matrix9 inverse_computed_from_cell = {{bohr_angstrom / 5.0,
+                                                  -bohr_angstrom / 40.0,
+                                                  -bohr_angstrom / 96.0,
+                                                  0.0,
+                                                  bohr_angstrom / 4.0,
+                                                  -bohr_angstrom / 16.0,
+                                                  0.0,
+                                                  0.0,
+                                                  bohr_angstrom / 3.0}};
+
+    const CellValidation out = validate_with_driver_thresholds(cell_wire, ase_inverse_wire);
+
+    ASSERT_TRUE(out.ok) << out.message;
+    EXPECT_NEAR(0.0, out.inverse_residual, 16.0 * EPSILON);
+    expect_matrix_near(inverse_computed_from_cell,
+                       out.computed_inverse_wire_bohr_inv,
+                       16.0 * EPSILON);
+}
+
 TEST(SocketFrameTest, RotatedDiagonalTracksRightSingularVectorsAndInverseOrder)
 {
     // Hand-multiplied U diag(5, 2, 0.5) V^T, with rational plane rotations.
@@ -87,13 +119,17 @@ TEST(SocketFrameTest, RotatedDiagonalTracksRightSingularVectorsAndInverseOrder)
 TEST(SocketFrameTest, InconsistentReceivedInverseIsRejected)
 {
     const Matrix9 cell = {{2.0, 1.0, 0.0, 0.0, 3.0, 1.0, 0.0, 0.0, 4.0}};
-    const Matrix9 wrong_inverse = {{1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0}};
+    // This is neither inv(cell) nor inv(cell)^T, so both supported wire
+    // layouts must reject it.
+    const Matrix9 wrong_inverse = {{0.6, -1.0 / 6.0, 1.0 / 24.0,
+                                     0.0, 1.0 / 3.0, -1.0 / 12.0,
+                                     0.0, 0.0, 0.25}};
 
     const CellValidation out = validate_with_driver_thresholds(cell, wrong_inverse);
 
     EXPECT_FALSE(out.ok);
     EXPECT_NE(std::string::npos, out.message.find("inverse"));
-    EXPECT_GT(out.inverse_residual, 1.0);
+    EXPECT_GT(out.inverse_residual, 0.1);
 }
 
 TEST(SocketFrameTest, ReceivedInverseResidualUsesConditionScaledRelativeTolerance)

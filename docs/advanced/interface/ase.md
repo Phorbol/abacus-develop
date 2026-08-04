@@ -107,6 +107,14 @@ Please read the examples in `interfaces/ASE_interface/examples/` for more detail
 
 For socket-driven ASE workflows, use the `AbacusSocketIO` calculator. ASE runs the i-PI socket server, while ABACUS keeps `calculation=scf` and is launched with `socket_driver=1` as the client. The protocol is simple: ASE sends atomic positions and cell data to ABACUS; ABACUS evaluates one SCF step for that structure and returns energy, forces, and virial. See the [ASE socket I/O documentation](https://ase-lib.org/ase/calculators/socketio/socketio.html) and the i-PI reference paper, [Ceriotti et al., Comput. Phys. Commun. 185, 1019-1026 (2014)](https://doi.org/10.1016/j.cpc.2013.10.027), for the protocol background.
 
+ASE and official i-PI serialize the POSDATA inverse-cell field differently for
+a general triclinic cell. Official i-PI sends `R = inverse(H)`, while ASE sends
+`H = A.T / Bohr` and `R = inverse(H).T` from its row-vector cell `A`. ABACUS
+checks both official-client layouts without weakening the numerical tolerance,
+then discards the received inverse and recomputes the authoritative inverse and
+reciprocal-cell state solely from `H`. A field that is neither `inverse(H)` nor
+`inverse(H).T` within tolerance is rejected.
+
 Build ABACUS as usual before using this interface. PW-only builds work with `basis_type=pw`; LCAO socket calculations require an LCAO-enabled executable. No extra socket library is required.
 
 With CMake, choose the executable according to the basis:

@@ -204,8 +204,9 @@ std::string socket_address()
 SocketFrame::Matrix9 ipi_cell_bohr_from_unitcell(const UnitCell& ucell)
 {
     const double lat0 = ucell.lat0;
-    // ASE/i-PI sends POSDATA cell as cell.T in C order. ABACUS stores
-    // lattice vectors as rows in latvec, so use the transposed order here.
+    // POSDATA H uses i-PI's column-vector cell convention. ASE therefore
+    // sends its row-vector cell A as A^T. ABACUS stores lattice vectors as
+    // rows in latvec, so use the transposed order here.
     return {{
         ucell.latvec.e11 * lat0, ucell.latvec.e21 * lat0, ucell.latvec.e31 * lat0,
         ucell.latvec.e12 * lat0, ucell.latvec.e22 * lat0, ucell.latvec.e32 * lat0,

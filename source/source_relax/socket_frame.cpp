@@ -131,7 +131,8 @@ long double scaled_determinant(const SocketFrame::Matrix9& values)
 }
 
 double received_inverse_residual(const SocketFrame::Matrix9& cell,
-                                 const SocketFrame::Matrix9& inverse)
+                                 const SocketFrame::Matrix9& inverse,
+                                 bool transpose_inverse)
 {
     long double maximum = 0.0L;
     for (int row = 0; row < MATRIX_DIMENSION; ++row)
@@ -141,8 +142,11 @@ double received_inverse_residual(const SocketFrame::Matrix9& cell,
             long double product = 0.0L;
             for (int inner = 0; inner < MATRIX_DIMENSION; ++inner)
             {
+                const int inverse_index = transpose_inverse
+                                              ? column * MATRIX_DIMENSION + inner
+                                              : inner * MATRIX_DIMENSION + column;
                 product += static_cast<long double>(cell[row * MATRIX_DIMENSION + inner])
-                           * inverse[inner * MATRIX_DIMENSION + column];
+                           * inverse[inverse_index];
             }
             const long double expected = row == column ? 1.0L : 0.0L;
             maximum = std::max(maximum, std::fabs(product - expected));
@@ -274,7 +278,11 @@ CellValidation validate_ipi_cell(const Matrix9& cell_wire,
         }
     }
 
-    result.inverse_residual = received_inverse_residual(cell_wire, inverse_wire);
+    const double direct_inverse_residual
+        = received_inverse_residual(cell_wire, inverse_wire, false);
+    const double transposed_inverse_residual
+        = received_inverse_residual(cell_wire, inverse_wire, true);
+    result.inverse_residual = std::min(direct_inverse_residual, transposed_inverse_residual);
     const double residual_limit
         = inverse_absolute_tolerance
           + inverse_relative_tolerance * result.condition_number_2

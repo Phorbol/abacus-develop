@@ -156,18 +156,25 @@ vectors as rows in `UnitCell::latvec`.
 Named conversion helpers will implement the mapping:
 
 ```text
-H_wire       = transpose(A_ASE)
-A_ABACUS     = transpose(H_wire)
-Hinv_wire    = inverse(H_wire)
+H_wire         = transpose(A_ASE)
+A_ABACUS       = transpose(H_wire)
+R_iPI_wire     = inverse(H_wire)
+R_ASE_wire     = transpose(inverse(H_wire))
 ```
 
 No call site should reproduce this conversion with incidental element indices.
 The same rule applies to physical tensor serialization: the 3x3 virial is
 transposed into the i-PI wire order exactly as ASE's `sendforce()` expects.
 
-The supplied inverse matrix is checked for finiteness and consistency but is
-not trusted as ABACUS internal state. ABACUS recomputes reciprocal-cell data
-from the validated cell.
+The two supported inverse-field layouts follow the official clients. Official
+i-PI sends `cell.h` together with `cell.ih = inverse(cell.h)`, so `H * R = I`.
+ASE stores row lattice vectors `A`, computes `icell = pinv(A).T`, and sends
+`H = A.T / Bohr` with `R = icell.T * Bohr = inverse(H).T`, so `H * R.T = I`.
+ABACUS accepts the field only when at least one of those two residuals satisfies
+the same absolute-plus-condition-scaled tolerance and records the smaller
+residual. The supplied inverse is never trusted as ABACUS internal state;
+ABACUS computes the authoritative inverse and reciprocal-cell data solely from
+the validated `H` cell.
 
 The socket path accepts a general right-handed nonsingular 3x3 cell. Official
 i-PI removes rigid cell rotations and represents its evolving cell as an upper
@@ -247,8 +254,9 @@ Validation includes:
 - `det(H) > 0`, rejecting left-handed, zero-volume, and singular cells;
 - a scaled nonsingularity check, initially requiring a 2-norm condition number
   below `1e12`;
-- a dimensionless `H * Hinv - I` residual checked with absolute and relative
-  tolerance;
+- the smaller of the dimensionless `H * R - I` and `H * R.T - I` residuals,
+  checked with the same absolute-plus-condition-scaled tolerance for the
+  official i-PI and ASE inverse-field layouts;
 - finite energy, force, stress, and virial results;
 - solver convergence through a narrow explicit solver-status interface or the
   existing solver failure mechanism, without introducing a new global control
