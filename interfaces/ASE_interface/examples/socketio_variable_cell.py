@@ -451,9 +451,9 @@ def _common_kwargs(config: Config) -> dict:
     if config.basis == "lcao":
         inp["gint_precision"] = "double" if config.precision == "double" else "mix"
         if config.device == "cpu":
-            # The single-process CPU validation path avoids the CUDA-aware
-            # ELPA host-array defect by using ABACUS's serial solver.
-            inp["ks_solver"] = "lapack"
+            # The parallel-capable validation path avoids the CUDA-aware ELPA
+            # host-array defect by using ABACUS's ScaLAPACK solver.
+            inp["ks_solver"] = "scalapack_gvx"
     kwargs = {
         "pseudopotentials": {"Si": "Si_ONCV_PBE-1.2.upf"},
         "inp": inp,
@@ -644,8 +644,9 @@ def prepare_case(config: Config, directory: Path, socket: bool = True) -> Path:
         r"^\s*ks_solver\s+(\S+)\s*$", text,
         flags=re.MULTILINE | re.IGNORECASE)]
     if config.basis == "lcao" and config.device == "cpu":
-        if solvers != ["lapack"]:
-            raise AssertionError("CPU LCAO validation requires exact ks_solver lapack")
+        if solvers != ["scalapack_gvx"]:
+            raise AssertionError(
+                "CPU LCAO validation requires exact ks_solver scalapack_gvx")
     elif solvers:
         raise AssertionError("ks_solver is reserved for CPU LCAO validation")
     return directory
@@ -1226,9 +1227,9 @@ def _analytic_self_test() -> None:
     solver_probe_root = Path("unused")
     solver_cases = (
         ("lcao-cpu-double", "lcao", "cpu", "double", 1.0e-9,
-         "double", "lapack"),
+         "double", "scalapack_gvx"),
         ("lcao-cpu-single", "lcao", "cpu", "single", 1.0e-6,
-         "mix", "lapack"),
+         "mix", "scalapack_gvx"),
         ("lcao-gpu-double", "lcao", "gpu", "double", 1.0e-9,
          "double", None),
         ("lcao-gpu-single", "lcao", "gpu", "single", 1.0e-6,
@@ -1271,8 +1272,8 @@ def _analytic_self_test() -> None:
                 label + " validation kwargs changed beyond ks_solver")
         if actual_solver != solver:
             raise AssertionError(
-                label + " must use exact ks_solver lapack"
-                if solver == "lapack" else
+                label + " must use exact ks_solver scalapack_gvx"
+                if solver == "scalapack_gvx" else
                 label + " must not set ks_solver")
 
     class InputWriterProbe:
@@ -1307,7 +1308,7 @@ def _analytic_self_test() -> None:
 
     current_module = sys.modules[__name__]
     with tempfile.TemporaryDirectory(
-            prefix="task9n-solver-input-selftest-") as temporary:
+            prefix="task9p-solver-input-selftest-") as temporary:
         input_root = Path(temporary)
         with patch.object(
                 current_module, "_load_abacus_api",
@@ -1339,7 +1340,7 @@ def _analytic_self_test() -> None:
                 precision="double", workdir=input_root,
                 output=input_root / "unused.json", pp_orb_root=input_root)
             cpu_lcao_kwargs = _common_kwargs(cpu_lcao_config)
-            for fallback_solver in ("genelpa", None):
+            for fallback_solver in ("lapack", "genelpa", None):
                 fallback_kwargs = copy.deepcopy(cpu_lcao_kwargs)
                 if fallback_solver is None:
                     fallback_kwargs["inp"].pop("ks_solver")
@@ -1357,7 +1358,8 @@ def _analytic_self_test() -> None:
                             socket=False)
                 except AssertionError as error:
                     if str(error) != (
-                            "CPU LCAO validation requires exact ks_solver lapack"):
+                            "CPU LCAO validation requires exact "
+                            "ks_solver scalapack_gvx"):
                         raise
                 else:
                     raise AssertionError(
