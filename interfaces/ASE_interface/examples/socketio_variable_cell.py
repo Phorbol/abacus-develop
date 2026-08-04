@@ -46,7 +46,6 @@ FILTER_LIMITS = {
     "shear_rtol": 1.0e-4, "shear_atol": 1.0e-8,
     "gradient_rtol": 1.0e-4, "gradient_atol_ev_per_angstrom3": 1.0e-7,
 }
-HARTREE_EV = 27.211386245988
 REQUIRED_FRAME_FIELDS = (
     "executable_version", "executable_sha256", "source_commit", "module",
     "backend", "device", "precision", "cell_angstrom",
@@ -211,10 +210,11 @@ def require_fd_plateau(records: list[dict], frames_required=None) -> None:
 
 def virial_from_ase_stress(stress: Iterable[float], volume: float) -> np.ndarray:
     """Invert ASE sigma=-W/V and return a full virial in Hartree."""
+    from ase import units
     from ase.stress import voigt_6_to_full_3x3_stress
     tensor = voigt_6_to_full_3x3_stress(
         np.asarray(tuple(stress), dtype=np.float64))
-    return -float(volume) * tensor / HARTREE_EV
+    return -float(volume) * tensor / units.Ha
 
 
 def validate_virial_sign(stress: Iterable[float], virial_hartree: np.ndarray,
@@ -1021,6 +1021,7 @@ def run_validation(config: Config) -> dict:
 def _analytic_self_test() -> None:
     from unittest.mock import patch
     from ase import units
+    from ase.stress import full_3x3_to_voigt_6_stress
     self_test_script = Path(__file__).resolve()
     if self_test_script.parents[2].name == "interfaces":
         expected_checkout_commit = subprocess.run(
@@ -1142,6 +1143,26 @@ def _analytic_self_test() -> None:
     reference_strain = np.array([0.02, -0.015, 0.01, 0.012, -0.009, 0.017])
     stiffness = np.array([1.2, 1.5, 1.8, 0.9, 1.1, 1.4])
     expected = stiffness * reference_strain / volume
+
+    capture_volume = 73.25
+    capture_virial_ev = np.array([
+        [4.0, -0.75, 1.125],
+        [-0.75, -2.5, 0.375],
+        [1.125, 0.375, 3.25],
+    ], dtype=np.float64)
+    capture_stress = (-full_3x3_to_voigt_6_stress(capture_virial_ev)
+                      / capture_volume)
+    captured_virial_hartree = capture_virial_ev / units.Ha
+    try:
+        validate_virial_sign(
+            capture_stress, captured_virial_hartree, capture_volume)
+    except AssertionError as error:
+        mismatch = np.max(np.abs(
+            captured_virial_hartree
+            - virial_from_ase_stress(capture_stress, capture_volume)))
+        raise AssertionError(
+            "capture-path virial closure mismatch: {:.17g} Ha".format(
+                mismatch)) from error
 
     def analytic_energy(varied):
         f = np.linalg.solve(base_cell, varied.cell.array).T
