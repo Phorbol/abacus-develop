@@ -62,9 +62,13 @@ built-in JSON types.
    `device gpu`. Both use PW, double precision, `ecutwfc 50`, `kspacing 0.45`,
    `scf_thr 1e-9`, `scf_nmax 100`, atomic charge initialization, forces, and
    stress. Socket keywords must be absent.
-6. Parse fresh energy, force, and stress through the existing FileIO/raw-log
-   validation path. Confirm one converged SCF and the declared device for every
-   case.
+6. Parse fresh forces and stress through the existing FileIO/raw-log validation
+   path. Parse exactly one raw `#TOTAL ENERGY# ... eV` value from each fresh
+   `running_scf.log` and use it as the replay energy. This matches the
+   Kohn-Sham free-energy quantity returned by the socket; ASE FileIO's possible
+   `E_KS(sigma->0)` value must not be compared with the socket energy. Record
+   both values and their provenance. Confirm one converged SCF and the declared
+   device for every case.
 7. Compare fresh CPU versus fresh GPU with the existing identical-frame
    thresholds. Separately compare each fresh result with the stored socket frame
    and record absolute residuals without using the broad conserved-energy
@@ -99,15 +103,17 @@ diagnostic output, not a reason to fabricate a pass.
 Fail before launching ABACUS for missing/mismatched files, non-finite values,
 frame-count mismatch, invalid cells, unsafe frame indices, or CPU/GPU INPUT
 differences beyond the device field. Fail the job for a nonzero process exit,
-missing log, wrong device identity, unconverged SCF, absent energy/force/stress,
-or non-finite output. Preserve completed case directories and logs for audit.
+missing log, zero or multiple raw total-energy values, wrong device identity,
+unconverged SCF, absent energy/force/stress, or non-finite output. Preserve
+completed case directories and logs for audit.
 
 ## Verification
 
 Focused tests will cover frame selection, cell/position reconstruction,
-CPU/GPU INPUT equivalence except `device`, finite JSON serialization, decision
-classification, and rejection of mismatched or non-finite inputs. Tests use
-synthetic fixtures and do not launch ABACUS.
+CPU/GPU INPUT equivalence except `device`, unique raw total-energy parsing,
+finite JSON serialization, decision classification, and rejection of
+mismatched or non-finite inputs. Tests use synthetic fixtures and do not launch
+ABACUS.
 
 One serial Slurm job will then run all twelve fresh SCFs (six frames times two
 devices) on one V100 allocation, with `OMP_NUM_THREADS=1`. The job will use the
