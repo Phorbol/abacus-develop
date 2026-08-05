@@ -125,6 +125,38 @@ class ReplayFrameTests(unittest.TestCase):
                     replay.load_replay_frames(
                         self.result_json, self.positions_xyz, (0, 1, 5))
 
+    def test_load_replay_frames_requires_angstrom_ipi_metadata(self):
+        invalid_headers = (
+            ("# CELL(abcABC): 5.43 5.21921 5.58486 86.10424 88.25568 "
+             "86.59486 Step: 0 Bead: 0 positions{angstrom} cell{bohr}"),
+            ("# CELL(abcABC): 5.43 5.21921 5.58486 86.10424 88.25568 "
+             "86.59486 Step: 0 Bead: 0 positions{bohr} cell{angstrom}"),
+        )
+        for header in invalid_headers:
+            with self.subTest(header=header):
+                self._write_xyz(["Si2"] * 6)
+                self._replace_first_header(header)
+                with self.assertRaises(AssertionError):
+                    replay.load_replay_frames(
+                        self.result_json, self.positions_xyz, (0, 1, 5))
+
+    def test_load_replay_frames_rejects_angles_outside_open_domain(self):
+        cellpar = [5.43, 5.21921, 5.58486,
+                   86.10424, 88.25568, 86.59486]
+        for angle_index in (3, 4, 5):
+            with self.subTest(angle_index=angle_index):
+                invalid_cellpar = cellpar.copy()
+                invalid_cellpar[angle_index] += 360.0
+                header = (
+                    "# CELL(abcABC): {} Step: 0 Bead: 0 "
+                    "positions{{angstrom}} cell{{angstrom}}".format(
+                        " ".join(str(value) for value in invalid_cellpar)))
+                self._write_xyz(["Si2"] * 6)
+                self._replace_first_header(header)
+                with self.assertRaises(AssertionError):
+                    replay.load_replay_frames(
+                        self.result_json, self.positions_xyz, (0, 1, 5))
+
     def test_actual_job_762695_frames_are_periodic_with_small_cell_delta(self):
         runtime = Path("/home/gengjianrui/bin/abacus-variable-cell-runtime")
         result = runtime / "results/gpu-pw-isotropic-762695.json"

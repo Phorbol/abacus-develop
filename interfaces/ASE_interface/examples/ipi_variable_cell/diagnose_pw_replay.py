@@ -31,19 +31,25 @@ def _read_ipi_cells(positions_path: Path, frame_count: int) -> list[np.ndarray]:
     headers = [line for line in lines if IPI_CELL_MARKER in line]
     cells = []
     for header in headers:
-        values_text, step_marker, _ = header.split(
+        values_text, step_marker, metadata = header.split(
             IPI_CELL_MARKER, 1)[1].partition("Step:")
         values = values_text.split()
         if not step_marker or len(values) != 6:
             raise AssertionError("i-PI CELL header must contain six values")
+        if metadata.split()[-2:] != [
+                "positions{angstrom}", "cell{angstrom}"]:
+            raise AssertionError(
+                "i-PI positions and CELL units must be angstrom")
         try:
             cellpar = np.asarray([float(value) for value in values],
                                  dtype=np.float64)
         except ValueError as error:
             raise AssertionError("i-PI CELL values must be numeric") from error
         if (not np.all(np.isfinite(cellpar))
-                or np.any(cellpar[:3] <= 0.0)):
-            raise AssertionError("i-PI CELL values must be finite and positive")
+                or np.any(cellpar[:3] <= 0.0)
+                or np.any(cellpar[3:] <= 0.0)
+                or np.any(cellpar[3:] >= 180.0)):
+            raise AssertionError("i-PI CELL lengths or angles are invalid")
         try:
             cell = cellpar_to_cell(cellpar).T
         except (AssertionError, ValueError) as error:
