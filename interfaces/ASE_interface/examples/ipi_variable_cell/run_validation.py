@@ -31,6 +31,12 @@ GPA_PER_EV_ANGSTROM3 = 160.2176634
 BOHR_ANGSTROM = 0.529177210903
 TEMPLATE_KEYS = ("__SOCKET_NAME__", "__TOTAL_STEPS__", "__PRESSURE_GPA__",
                  "__SEED__", "__PREFIX__")
+EXPECTED_IPI_PROPERTIES = (
+    "step", "potential{electronvolt}", "conserved{electronvolt}",
+    "atom_f{electronvolt/angstrom}(0)",
+    "atom_f{electronvolt/angstrom}(1)",
+    "volume", "cell_h", "virial_md",
+)
 IPI_VOLUME_LIMITS = {"rtol": 1.0e-10, "atol_bohr3": 1.0e-8}
 PRESSURE_DIRECTION_LIMITS = {"rtol": 1.0e-8, "atol_bohr3": 1.0e-8}
 IPI_STABILITY_LIMITS = {
@@ -101,6 +107,8 @@ def render_template(template: Path, socket_name: str, total_steps: int,
 def validate_official_xml(xml_text: str, directory: Path):
     """Parse with the official i-PI 3.2.0 engine, not only ElementTree."""
     import ipi
+    from ipi.engine.outputs import PropertyOutput
+    from ipi.engine.properties import getkey
     from ipi.engine.simulation import Simulation
     if ipi.__version__ != IPI_VERSION:
         raise AssertionError("requires official i-PI=={}".format(IPI_VERSION))
@@ -109,6 +117,42 @@ def validate_official_xml(xml_text: str, directory: Path):
             io.StringIO(xml_text), read_only=True, request_banner=False)
     if simulation is None:
         raise AssertionError("official i-PI parser returned no simulation")
+    property_outputs = [
+        output for output in simulation.outtemplate
+        if isinstance(output, PropertyOutput)]
+    if len(simulation.syslist) != 1 or len(property_outputs) != 1:
+        raise AssertionError(
+            "official i-PI output contract requires one system and one property output")
+    actual = tuple(str(item) for item in property_outputs[0].outlist)
+    if actual != EXPECTED_IPI_PROPERTIES:
+        raise AssertionError("official i-PI property output contract is wrong")
+    system = simulation.syslist[0]
+    with tempfile.TemporaryDirectory(
+            prefix="ipi-property-output-", dir=directory) as temporary:
+        disposable = Path(temporary) / "properties"
+        output = PropertyOutput(filename=str(disposable), outlist=actual)
+        try:
+            output.bind(system)
+            output.print_header()
+            columns = 0
+            for item in actual:
+                declared = system.properties.property_dict[getkey(item)]
+                size = declared.get("size", 1)
+                columns += 1 if size == 1 else size
+            if columns != 22:
+                raise AssertionError(
+                    "official i-PI property output must declare 22 columns")
+        except (KeyError, ValueError, RuntimeError) as error:
+            raise AssertionError(
+                "official i-PI property output cannot bind or print its header") from error
+        finally:
+            try:
+                output.close_stream()
+            finally:
+                try:
+                    disposable.unlink()
+                except FileNotFoundError:
+                    pass
     return simulation
 
 
@@ -588,24 +632,47 @@ def run_validation(config: ase_validation.Config, mode: str, steps: int) -> dict
 
 def _self_test() -> None:
     import ipi
+    from ipi.engine.outputs import PropertyOutput
     from ipi.engine.simulation import Simulation
     assert ipi.__version__ == IPI_VERSION
     with tempfile.TemporaryDirectory(prefix="task7-ipi-selftest-") as temporary:
         directory = Path(temporary)
         shutil.copy2(HERE / "init.xyz", directory / "init.xyz")
+        expected = (
+            "step", "potential{electronvolt}", "conserved{electronvolt}",
+            "atom_f{electronvolt/angstrom}(0)",
+            "atom_f{electronvolt/angstrom}(1)",
+            "volume", "cell_h", "virial_md",
+        )
+        rendered = {}
         for mode in ("isotropic", "flexible"):
             xml = render_template(HERE / (mode + ".xml"), "unique_socket",
                                   5, 1.25, 1729, "dry-" + mode)
+            rendered[mode] = xml
             assert not any(key in xml for key in TEMPLATE_KEYS)
             root = ET.fromstring(xml)
             assert root.find(".//barostat").attrib["mode"] == mode
             assert root.find(".//pressure").attrib["units"] == "gigapascal"
             simulation = validate_official_xml(xml, directory)
+            property_outputs = [
+                output for output in simulation.outtemplate
+                if isinstance(output, PropertyOutput)]
+            assert len(property_outputs) == 1
+            assert tuple(str(item) for item in property_outputs[0].outlist) == expected
             system = simulation.syslist[0]
             assert np.all(np.asarray(system.beads.p) == 0.0)
             assert np.all(np.asarray(system.motion.barostat.p) == 0.0)
             if mode == "flexible":
                 assert type(system.motion.barostat).__name__ == "BaroMTK"
+        unrecognized = rendered["isotropic"].replace(
+            "atom_f{electronvolt/angstrom}(0)", "not_a_property")
+        try:
+            validate_official_xml(unrecognized, directory)
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError(
+                "unrecognized i-PI output property was accepted")
         official_samples = []
         official_md_steps = []
         class DummyCheckpoint:
