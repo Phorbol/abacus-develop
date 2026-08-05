@@ -468,8 +468,10 @@ def evaluate_ipi_stability(parsed: dict, mode: str, checkpoint: Path) -> dict:
     limits = IPI_STABILITY_LIMITS
     cell_change = float(np.max(np.abs(cells - cells[0])))
     virial_change = float(np.max(np.abs(virials - virials[0])))
-    cell_stale_tolerance = limits["stale_atol"] + limits["stale_rtol"] * np.max(np.abs(cells))
-    virial_stale_tolerance = limits["stale_atol"] + limits["stale_rtol"] * np.max(np.abs(virials))
+    cell_stale_tolerance = float(
+        limits["stale_atol"] + limits["stale_rtol"] * np.max(np.abs(cells)))
+    virial_stale_tolerance = float(
+        limits["stale_atol"] + limits["stale_rtol"] * np.max(np.abs(virials)))
     ratio = float(np.max(volumes) / np.min(volumes))
     drift = float(np.max(np.abs(conserved - conserved[0])))
     drift_tolerance = (limits["conserved_atol_ev"] + limits["conserved_rtol"]
@@ -487,6 +489,8 @@ def evaluate_ipi_stability(parsed: dict, mode: str, checkpoint: Path) -> dict:
                                    else shear_change > shear_tolerance),
         "checkpoint_nonempty": checkpoint.is_file() and checkpoint.stat().st_size > 0,
     }
+    decisions = {
+        name: bool(passed) for name, passed in decisions.items()}
     result = {
         "thresholds": limits, "decisions": decisions,
         "cell_max_change_bohr": cell_change, "virial_max_change_hartree": virial_change,
@@ -806,8 +810,17 @@ def _self_test() -> None:
             [5.43, 0.31, 0.17], [0.0, 5.21, 0.37], [0.0, 0.0, 5.57]]
         checkpoint = directory / "synthetic.checkpoint"
         checkpoint.write_text("checkpoint")
-        assert evaluate_ipi_stability(parsed, "flexible", checkpoint)[
-            "decisions"]["flexible_shear_changed"]
+        stability_results = {
+            mode: evaluate_ipi_stability(parsed, mode, checkpoint)
+            for mode in ("isotropic", "flexible")
+        }
+        for mode, stability in stability_results.items():
+            assert_json_ready(stability, "$.{}_stability".format(mode))
+            assert all(type(value) is bool
+                       for value in stability["decisions"].values())
+        assert stability_results["flexible"]["decisions"][
+            "flexible_shear_changed"]
+        parsed["stability"] = stability_results["flexible"]
         dummy_config = ase_validation.Config(
             "unused", "pw", "cpu", "double", directory,
             directory / "unused.json", directory)
