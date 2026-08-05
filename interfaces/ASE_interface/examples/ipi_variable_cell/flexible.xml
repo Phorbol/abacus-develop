@@ -1,6 +1,6 @@
-<simulation verbosity="medium">
+<simulation verbosity="medium" floatformat="%24.16e">
   <output prefix="__PREFIX__">
-    <properties stride="1" filename="properties">[ step, potential{electronvolt}, conserved{electronvolt}, atom_f{electronvolt/angstrom}(0), atom_f{electronvolt/angstrom}(1), volume, cell_h, virial_md ]</properties>
+    <properties stride="1" filename="properties">[ step, potential{electronvolt}, conserved{electronvolt}, atom_f{ev/ang}(0), atom_f{ev/ang}(1), volume, cell_h, virial_md ]</properties>
     <trajectory stride="1" filename="positions" format="xyz" cell_units="angstrom">positions{angstrom}</trajectory>
     <checkpoint stride="__TOTAL_STEPS__" filename="checkpoint"/>
   </output>

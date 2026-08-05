@@ -33,8 +33,8 @@ TEMPLATE_KEYS = ("__SOCKET_NAME__", "__TOTAL_STEPS__", "__PRESSURE_GPA__",
                  "__SEED__", "__PREFIX__")
 EXPECTED_IPI_PROPERTIES = (
     "step", "potential{electronvolt}", "conserved{electronvolt}",
-    "atom_f{electronvolt/angstrom}(0)",
-    "atom_f{electronvolt/angstrom}(1)",
+    "atom_f{ev/ang}(0)",
+    "atom_f{ev/ang}(1)",
     "volume", "cell_h", "virial_md",
 )
 IPI_VOLUME_LIMITS = {"rtol": 1.0e-10, "atol_bohr3": 1.0e-8}
@@ -163,6 +163,49 @@ def wait_until(predicate, timeout: float, interval: float = 0.02) -> bool:
             return True
         time.sleep(interval)
     return bool(predicate())
+
+
+def abacus_exit_state(returncode, zero_exit_at,
+                      now: float, shutdown_grace: float):
+    if returncode is None:
+        return "running", zero_exit_at
+    if returncode != 0:
+        return "nonzero", zero_exit_at
+    if zero_exit_at is None:
+        zero_exit_at = now
+    if now - zero_exit_at >= shutdown_grace:
+        return "grace-timeout", zero_exit_at
+    return "grace", zero_exit_at
+
+
+def wait_for_ipi_shutdown(ipi_process, abacus_process,
+                          trajectory_timeout: float = 900.0,
+                          shutdown_grace: float = 15.0,
+                          poll_interval: float = 0.1,
+                          monotonic=time.monotonic,
+                          sleeper=time.sleep) -> int:
+    deadline = monotonic() + trajectory_timeout
+    zero_exit_at = None
+    while True:
+        ipi_returncode = ipi_process.poll()
+        if ipi_returncode is not None:
+            return ipi_returncode
+        now = monotonic()
+        abacus_returncode = abacus_process.poll()
+        state, zero_exit_at = abacus_exit_state(
+            abacus_returncode, zero_exit_at, now, shutdown_grace)
+        if state == "nonzero":
+            raise RuntimeError(
+                "ABACUS exited with {}".format(abacus_returncode))
+        if state == "grace-timeout":
+            raise TimeoutError(
+                "i-PI did not exit within {} seconds after ABACUS rc=0".format(
+                    shutdown_grace))
+        if state == "running" and now >= deadline:
+            raise TimeoutError(
+                "i-PI trajectory exceeded {} seconds".format(
+                    trajectory_timeout))
+        sleeper(poll_interval)
 
 
 def start_managed_process(argv, **kwargs) -> subprocess.Popen:
@@ -550,15 +593,11 @@ def run_instance(config: ase_validation.Config, mode: str, run_dir: Path,
             shlex.split(config.abacus), cwd=abacus_dir, env=environment,
             stdout=abacus_out, stderr=abacus_err)
         processes.append(abacus_process)
-        deadline = time.monotonic() + max(300.0, 90.0 * steps)
-        while ipi_process.poll() is None and time.monotonic() < deadline:
-            if abacus_process.poll() is not None:
-                raise RuntimeError("ABACUS exited before i-PI completed")
-            time.sleep(0.1)
-        if ipi_process.poll() is None:
-            raise TimeoutError("i-PI trajectory exceeded bounded timeout")
-        if ipi_process.returncode != 0:
-            raise RuntimeError("i-PI exited with {}".format(ipi_process.returncode))
+        ipi_returncode = wait_for_ipi_shutdown(
+            ipi_process, abacus_process,
+            trajectory_timeout=max(300.0, 90.0 * steps))
+        if ipi_returncode != 0:
+            raise RuntimeError("i-PI exited with {}".format(ipi_returncode))
         try:
             abacus_process.wait(timeout=10.0)
         except subprocess.TimeoutExpired as error:
@@ -634,14 +673,15 @@ def _self_test() -> None:
     import ipi
     from ipi.engine.outputs import PropertyOutput
     from ipi.engine.simulation import Simulation
+    from ipi.utils.units import unit_to_user
     assert ipi.__version__ == IPI_VERSION
     with tempfile.TemporaryDirectory(prefix="task7-ipi-selftest-") as temporary:
         directory = Path(temporary)
         shutil.copy2(HERE / "init.xyz", directory / "init.xyz")
         expected = (
             "step", "potential{electronvolt}", "conserved{electronvolt}",
-            "atom_f{electronvolt/angstrom}(0)",
-            "atom_f{electronvolt/angstrom}(1)",
+            "atom_f{ev/ang}(0)",
+            "atom_f{ev/ang}(1)",
             "volume", "cell_h", "virial_md",
         )
         rendered = {}
@@ -651,6 +691,7 @@ def _self_test() -> None:
             rendered[mode] = xml
             assert not any(key in xml for key in TEMPLATE_KEYS)
             root = ET.fromstring(xml)
+            assert root.attrib["floatformat"] == "%24.16e"
             assert root.find(".//barostat").attrib["mode"] == mode
             assert root.find(".//pressure").attrib["units"] == "gigapascal"
             simulation = validate_official_xml(xml, directory)
@@ -665,7 +706,7 @@ def _self_test() -> None:
             if mode == "flexible":
                 assert type(system.motion.barostat).__name__ == "BaroMTK"
         unrecognized = rendered["isotropic"].replace(
-            "atom_f{electronvolt/angstrom}(0)", "not_a_property")
+            "atom_f{ev/ang}(0)", "not_a_property")
         try:
             validate_official_xml(unrecognized, directory)
         except AssertionError:
@@ -673,6 +714,17 @@ def _self_test() -> None:
         else:
             raise AssertionError(
                 "unrecognized i-PI output property was accepted")
+        assert np.all(np.isfinite(unit_to_user(
+            "force", "ev/ang", np.asarray([1.0], dtype=np.float64))))
+        assert np.all(np.isfinite(unit_to_user(
+            "energy", "electronvolt", np.asarray([1.0], dtype=np.float64))))
+        try:
+            unit_to_user("force", "electronvolt/angstrom",
+                         np.asarray([1.0], dtype=np.float64))
+        except TypeError:
+            pass
+        else:
+            raise AssertionError("invalid long-form i-PI force unit was accepted")
         official_samples = []
         official_md_steps = []
         class DummyCheckpoint:
@@ -970,6 +1022,57 @@ def _self_test() -> None:
         assert wait_until(child_gone, 2.0)
         graceful = start_managed_process([sys.executable, "-c", "raise SystemExit(0)"])
         assert graceful.wait(timeout=2.0) == 0
+        class FakeProcess:
+            def __init__(self, returncodes):
+                self.returncodes = list(returncodes)
+            def poll(self):
+                if len(self.returncodes) > 1:
+                    return self.returncodes.pop(0)
+                return self.returncodes[0]
+        class FakeClock:
+            def __init__(self, values):
+                self.values = iter(values)
+            def __call__(self):
+                return next(self.values)
+        assert abacus_exit_state(None, None, 3.0, 15.0) == ("running", None)
+        assert abacus_exit_state(0, None, 3.0, 15.0) == ("grace", 3.0)
+        assert abacus_exit_state(0, 3.0, 18.0, 15.0) == (
+            "grace-timeout", 3.0)
+        assert wait_for_ipi_shutdown(
+            FakeProcess([None, None, 0]), FakeProcess([None, 0]),
+            monotonic=FakeClock([0.0, 0.0, 1.0]),
+            sleeper=lambda _: None) == 0
+        try:
+            wait_for_ipi_shutdown(
+                FakeProcess([None]), FakeProcess([9, 0]),
+                monotonic=FakeClock([0.0, 0.0]), sleeper=lambda _: None)
+        except RuntimeError as error:
+            assert str(error) == "ABACUS exited with 9"
+        else:
+            raise AssertionError("nonzero ABACUS exit was accepted")
+        try:
+            wait_for_ipi_shutdown(
+                FakeProcess([None, None]), FakeProcess([0, 0]),
+                monotonic=FakeClock([0.0, 0.0, 15.0]),
+                sleeper=lambda _: None)
+        except TimeoutError as error:
+            assert "within 15" in str(error)
+        else:
+            raise AssertionError("stalled i-PI shutdown was accepted")
+        try:
+            wait_for_ipi_shutdown(
+                FakeProcess([None]), FakeProcess([None]),
+                trajectory_timeout=900.0,
+                monotonic=FakeClock([0.0, 900.0]),
+                sleeper=lambda _: None)
+        except TimeoutError as error:
+            assert "exceeded 900" in str(error)
+        else:
+            raise AssertionError("trajectory timeout was accepted")
+        assert wait_for_ipi_shutdown(
+            FakeProcess([None, None, None, 0]), FakeProcess([0, 0, 0]),
+            monotonic=FakeClock([0.0, 899.0, 900.0, 913.999]),
+            sleeper=lambda _: None) == 0
         socket_name = "abacus_vc_selftest"
         owned = owned_socket_path(socket_name)
         owned.write_text("owned")
