@@ -10,7 +10,6 @@ from pathlib import Path
 
 import numpy as np
 from ase import Atoms
-from ase.io import write
 
 from . import diagnose_pw_replay as replay
 
@@ -26,16 +25,12 @@ class ReplayFrameTests(unittest.TestCase):
                       [2.70, 2.60 + 0.02 * index, 2.50]], dtype=np.float64)
             for index in range(6)
         ]
-        self.xyz_cells = [
-            np.array([[5.40 + 0.01 * index, 0.10, 0.02],
-                      [0.00, 5.20, 0.03],
-                      [0.00, 0.00, 5.60]], dtype=np.float64)
-            for index in range(6)
-        ]
-        self.json_cells = [
-            cell + np.diag([1.0e-10, 2.0e-10, 3.0e-10])
-            for cell in self.xyz_cells
-        ]
+        self.json_cells = [np.array([
+            [5.429999929239518, 0.30999999596026717,
+             0.16999999778466263],
+            [0.0, 5.209999932106425, 0.36999999517838333],
+            [0.0, 0.0, 5.569999927415123],
+        ], dtype=np.float64) for _ in range(6)]
         self.payload = {
             "schema_version": 1,
             "ipi_version": "3.2.0",
@@ -70,12 +65,26 @@ class ReplayFrameTests(unittest.TestCase):
         self.result_json.write_text(json.dumps(payload) + "\n")
 
     def _write_xyz(self, symbols):
-        frames = [
-            Atoms(frame_symbols, positions=self.xyz_positions[index],
-                  cell=self.xyz_cells[index], pbc=True)
-            for index, frame_symbols in enumerate(symbols)
-        ]
-        write(str(self.positions_xyz), frames, format="extxyz")
+        lines = []
+        for index, frame_symbols in enumerate(symbols):
+            chemical_symbols = Atoms(frame_symbols).get_chemical_symbols()
+            lines.extend([
+                str(len(chemical_symbols)),
+                ("# CELL(abcABC):    5.43000     5.21921     5.58486  "
+                 "  86.10424    88.25568    86.59486  Step: "
+                 "          {:d}  Bead:       0 positions{{angstrom}}  "
+                 "cell{{angstrom}}".format(index)),
+            ])
+            for symbol, position in zip(
+                    chemical_symbols, self.xyz_positions[index]):
+                lines.append("{:>8s} {: .8e} {: .8e} {: .8e}".format(
+                    symbol, *position))
+        self.positions_xyz.write_text("\n".join(lines) + "\n")
+
+    def _replace_first_header(self, replacement):
+        lines = self.positions_xyz.read_text().splitlines()
+        lines[1] = replacement
+        self.positions_xyz.write_text("\n".join(lines) + "\n")
 
     def test_parse_frame_indices_requires_unique_sorted_in_range_values(self):
         self.assertEqual(replay.parse_frame_indices("0,1,5", 6), (0, 1, 5))
@@ -92,7 +101,48 @@ class ReplayFrameTests(unittest.TestCase):
                                    self.xyz_positions[1], rtol=0.0, atol=0.0)
         np.testing.assert_allclose(frames[1]["atoms"].cell.array,
                                    self.json_cells[1], rtol=0.0, atol=0.0)
+        np.testing.assert_array_equal(frames[1]["atoms"].pbc,
+                                      [True, True, True])
+        self.assertAlmostEqual(
+            frames[0]["xyz_cell_max_abs_delta_angstrom"],
+            4.428902746766994e-06, places=15)
         self.assertEqual(payload["ipi_version"], "3.2.0")
+
+    def test_load_replay_frames_rejects_invalid_ipi_cell_metadata(self):
+        invalid_headers = (
+            "# Step: 0 Bead: 0 positions{angstrom} cell{angstrom}",
+            "# CELL(abcABC): 5.43 5.21921 5.58486 86.10424 88.25568 Step: 0",
+            ("# CELL(abcABC): nan 5.21921 5.58486 86.10424 88.25568 "
+             "86.59486 Step: 0"),
+            ("# CELL(abcABC): -5.43 5.21921 5.58486 86.10424 88.25568 "
+             "86.59486 Step: 0"),
+        )
+        for header in invalid_headers:
+            with self.subTest(header=header):
+                self._write_xyz(["Si2"] * 6)
+                self._replace_first_header(header)
+                with self.assertRaises(AssertionError):
+                    replay.load_replay_frames(
+                        self.result_json, self.positions_xyz, (0, 1, 5))
+
+    def test_actual_job_762695_frames_are_periodic_with_small_cell_delta(self):
+        runtime = Path("/home/gengjianrui/bin/abacus-variable-cell-runtime")
+        result = runtime / "results/gpu-pw-isotropic-762695.json"
+        positions = runtime / (
+            "work/gpu-pw-isotropic-762695/trajectory/"
+            "isotropic-abacus_vc_isotropic_1775430_"
+            "1785917255506141486.positions_0.xyz")
+        if not result.is_file() or not positions.is_file():
+            self.skipTest("read-only Job 762695 artifacts are unavailable")
+
+        _, frames = replay.load_replay_frames(
+            result, positions, replay.DEFAULT_FRAME_INDICES)
+
+        self.assertTrue(all(np.all(frame["atoms"].pbc) for frame in frames))
+        deltas = np.asarray([
+            frame["xyz_cell_max_abs_delta_angstrom"] for frame in frames])
+        self.assertTrue(np.all(np.isfinite(deltas)))
+        self.assertLess(float(np.max(deltas)), 1.0e-5)
 
     def test_load_replay_frames_rejects_frame_count_mismatch(self):
         payload = copy.deepcopy(self.payload)

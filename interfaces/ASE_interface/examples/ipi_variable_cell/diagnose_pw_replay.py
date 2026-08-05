@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+from ase.geometry import cellpar_to_cell
 from ase.io import read
 
 HERE = Path(__file__).resolve().parent
@@ -19,6 +20,37 @@ import run_validation
 import socketio_variable_cell as ase_validation
 
 DEFAULT_FRAME_INDICES: tuple[int, ...] = (0, 1, 5, 8, 42, 50)
+IPI_CELL_MARKER = "CELL(abcABC):"
+
+
+def _read_ipi_cells(positions_path: Path, frame_count: int) -> list[np.ndarray]:
+    """Parse rounded i-PI cells into the JSON matrix orientation."""
+    lines = Path(positions_path).read_text().splitlines()
+    if sum(line.count(IPI_CELL_MARKER) for line in lines) != frame_count:
+        raise AssertionError("XYZ must contain one i-PI CELL header per frame")
+    headers = [line for line in lines if IPI_CELL_MARKER in line]
+    cells = []
+    for header in headers:
+        values_text, step_marker, _ = header.split(
+            IPI_CELL_MARKER, 1)[1].partition("Step:")
+        values = values_text.split()
+        if not step_marker or len(values) != 6:
+            raise AssertionError("i-PI CELL header must contain six values")
+        try:
+            cellpar = np.asarray([float(value) for value in values],
+                                 dtype=np.float64)
+        except ValueError as error:
+            raise AssertionError("i-PI CELL values must be numeric") from error
+        if (not np.all(np.isfinite(cellpar))
+                or np.any(cellpar[:3] <= 0.0)):
+            raise AssertionError("i-PI CELL values must be finite and positive")
+        try:
+            cell = cellpar_to_cell(cellpar).T
+        except (AssertionError, ValueError) as error:
+            raise AssertionError("i-PI CELL geometry is invalid") from error
+        ase_validation.assert_valid_frame(cell, np.empty((0, 3)))
+        cells.append(cell)
+    return cells
 
 
 def _validate_indices(indices: tuple[int, ...], frame_count: int) -> None:
@@ -73,6 +105,7 @@ def load_replay_frames(result_path: Path, positions_path: Path,
         xyz_frames = [xyz_frames]
     if len(stored_steps) != len(xyz_frames):
         raise AssertionError("JSON and XYZ frame counts differ")
+    xyz_cells = _read_ipi_cells(positions_path, len(xyz_frames))
     _validate_indices(indices, len(stored_steps))
     if indices == DEFAULT_FRAME_INDICES and len(stored_steps) != 51:
         raise AssertionError("the default Job 762695 replay requires 51 frames")
@@ -93,13 +126,14 @@ def load_replay_frames(result_path: Path, positions_path: Path,
         xyz_atoms = xyz_frames[index]
         atoms = xyz_atoms.copy()
         atoms.set_cell(json_cell, scale_atoms=False)
+        atoms.set_pbc((True, True, True))
         ase_validation.assert_valid_frame(json_cell, atoms.positions)
         frames.append({
             "index": index,
             "atoms": atoms,
             "stored_gpu": stored_step,
             "xyz_cell_max_abs_delta_angstrom": float(
-                np.max(np.abs(xyz_atoms.cell.array - json_cell))),
+                np.max(np.abs(xyz_cells[index] - json_cell))),
         })
     return payload, frames
 
