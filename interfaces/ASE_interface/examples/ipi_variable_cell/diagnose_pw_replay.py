@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+from ase.cell import Cell
 from ase.geometry import cellpar_to_cell
 from ase.io import read
 
@@ -27,30 +28,54 @@ import socketio_variable_cell as ase_validation
 
 DEFAULT_FRAME_INDICES: tuple[int, ...] = (0, 1, 5, 8, 42, 50)
 IPI_CELL_MARKER = "CELL(abcABC):"
+# i-PI writes abcABC values with five digits after the decimal point.  The
+# half-quantization interval is 5.0e-6 in the native length (angstrom) and
+# angle (degree) units.  Allow another 0.1e-6 for the upstream
+# bohr-to-angstrom conversion and cellpar reconstruction; the immutable Job
+# 762695 source reaches 5.058800658e-6 while a full last-digit disagreement is
+# still rejected.
+IPI_CELL_PARAMETER_TOLERANCE = 5.1e-6
+_SOURCE_FRAME_IDENTITY_KEYS = (
+    "executable_version", "executable_sha256", "source_commit", "module",
+    "source", "backend", "device", "precision")
 
 
-def _read_ipi_cells(positions_path: Path, frame_count: int) -> list[np.ndarray]:
-    """Parse rounded i-PI cells into the JSON matrix orientation."""
+def _read_ipi_cells(positions_path: Path, frame_count: int) -> list[dict]:
+    """Parse rounded i-PI cell, step, bead, and unit metadata."""
     lines = Path(positions_path).read_text().splitlines()
     if sum(line.count(IPI_CELL_MARKER) for line in lines) != frame_count:
         raise AssertionError("XYZ must contain one i-PI CELL header per frame")
     headers = [line for line in lines if IPI_CELL_MARKER in line]
-    cells = []
-    for header in headers:
+    records = []
+    for expected_step, header in enumerate(headers):
+        if header.count(IPI_CELL_MARKER) != 1:
+            raise AssertionError("XYZ frame must contain one i-PI CELL marker")
         values_text, step_marker, metadata = header.split(
             IPI_CELL_MARKER, 1)[1].partition("Step:")
         values = values_text.split()
         if not step_marker or len(values) != 6:
             raise AssertionError("i-PI CELL header must contain six values")
-        if metadata.split()[-2:] != [
-                "positions{angstrom}", "cell{angstrom}"]:
+        metadata_fields = metadata.split()
+        if (len(metadata_fields) != 5
+                or metadata_fields[1] != "Bead:"
+                or metadata_fields[3:] != [
+                    "positions{angstrom}", "cell{angstrom}"]):
             raise AssertionError(
-                "i-PI positions and CELL units must be angstrom")
+                "i-PI Step, Bead, and angstrom units are required")
         try:
             cellpar = np.asarray([float(value) for value in values],
                                  dtype=np.float64)
+            step = int(metadata_fields[0])
+            bead = int(metadata_fields[2])
         except ValueError as error:
-            raise AssertionError("i-PI CELL values must be numeric") from error
+            raise AssertionError(
+                "i-PI CELL, Step, and Bead values must be numeric") from error
+        if step != expected_step:
+            raise AssertionError(
+                "i-PI XYZ steps must be ordered exactly 0..{}".format(
+                    frame_count - 1))
+        if bead != 0:
+            raise AssertionError("i-PI replay requires Bead 0")
         if (not np.all(np.isfinite(cellpar))
                 or np.any(cellpar[:3] <= 0.0)
                 or np.any(cellpar[3:] <= 0.0)
@@ -61,8 +86,83 @@ def _read_ipi_cells(positions_path: Path, frame_count: int) -> list[np.ndarray]:
         except (AssertionError, ValueError) as error:
             raise AssertionError("i-PI CELL geometry is invalid") from error
         ase_validation.assert_valid_frame(cell, np.empty((0, 3)))
-        cells.append(cell)
-    return cells
+        records.append({
+            "cell": cell,
+            "cellpar": cellpar,
+            "step": step,
+            "bead": bead,
+        })
+    return records
+
+
+def _validate_trajectory_metadata(
+        trajectory: dict, frame_count: int, positions_path: Path) -> None:
+    """Bind an official completed trajectory to its positions artifact."""
+    expected_steps = frame_count - 1
+    for key in ("requested_steps", "completed_steps", "sample_count"):
+        if type(trajectory.get(key)) is not int:
+            raise AssertionError("trajectory {} must be an integer".format(key))
+    if (trajectory["requested_steps"] != expected_steps
+            or trajectory["completed_steps"] != expected_steps
+            or trajectory["sample_count"] != frame_count
+            or trajectory.get("includes_initial_frame") is not True):
+        raise AssertionError(
+            "trajectory completion metadata disagrees with stored frames")
+    mode = trajectory.get("mode")
+    socket_name = trajectory.get("socket_name")
+    if mode not in ("isotropic", "flexible"):
+        raise AssertionError("trajectory mode is not an official i-PI mode")
+    if (not isinstance(socket_name, str)
+            or re.fullmatch(r"abacus_vc_[A-Za-z0-9_]+", socket_name) is None):
+        raise AssertionError("trajectory socket name is invalid")
+    expected_name = "{}-{}.positions_0.xyz".format(mode, socket_name)
+    if Path(positions_path).name != expected_name:
+        raise AssertionError(
+            "positions filename disagrees with trajectory mode/socket name")
+
+
+def _validate_stored_frame(
+        stored_step: dict, xyz_atoms, xyz_metadata: dict,
+        index: int, expected_identity) -> tuple[np.ndarray, dict]:
+    """Validate one official stored frame and its matching XYZ record."""
+    if not isinstance(stored_step, dict):
+        raise AssertionError("stored replay frame must be an object")
+    ase_validation.assert_real_frame_schema(stored_step)
+    if (type(stored_step.get("ipi_property_step")) is not int
+            or type(stored_step.get("is_initial_frame")) is not bool):
+        raise AssertionError("stored i-PI step/initial metadata has wrong types")
+    required_values = {
+        "source": "official-ipi",
+        "backend": "pw",
+        "device": "gpu",
+        "precision": "double",
+        "ipi_property_step": index,
+        "is_initial_frame": index == 0,
+    }
+    if any(stored_step.get(key) != value
+           for key, value in required_values.items()):
+        raise AssertionError("stored replay frame identity or sequence is wrong")
+    if stored_step["atom_count"] != len(xyz_atoms):
+        raise AssertionError("stored atom count disagrees with XYZ")
+    identity = {
+        key: stored_step.get(key) for key in _SOURCE_FRAME_IDENTITY_KEYS}
+    if expected_identity is not None and identity != expected_identity:
+        raise AssertionError("stored replay frame identities are inconsistent")
+    try:
+        json_cell = np.asarray(stored_step["cell_angstrom"],
+                               dtype=np.float64)
+    except (TypeError, ValueError) as error:
+        raise AssertionError("stored replay cell must be numeric") from error
+    ase_validation.assert_valid_frame(json_cell, xyz_atoms.positions)
+    json_cellpar = Cell(json_cell.T).cellpar()
+    cellpar_error = np.abs(xyz_metadata["cellpar"] - json_cellpar)
+    if np.any(cellpar_error[:3] > IPI_CELL_PARAMETER_TOLERANCE):
+        raise AssertionError(
+            "XYZ and JSON cell lengths exceed abcABC quantization")
+    if np.any(cellpar_error[3:] > IPI_CELL_PARAMETER_TOLERANCE):
+        raise AssertionError(
+            "XYZ and JSON cell angles exceed abcABC quantization")
+    return json_cell, identity
 
 
 def _validate_indices(indices: tuple[int, ...], frame_count: int) -> None:
@@ -117,36 +217,37 @@ def load_replay_frames(result_path: Path, positions_path: Path,
         xyz_frames = [xyz_frames]
     if len(stored_steps) != len(xyz_frames):
         raise AssertionError("JSON and XYZ frame counts differ")
-    xyz_cells = _read_ipi_cells(positions_path, len(xyz_frames))
+    _validate_trajectory_metadata(trajectory, len(stored_steps), positions_path)
+    xyz_metadata = _read_ipi_cells(positions_path, len(xyz_frames))
     _validate_indices(indices, len(stored_steps))
     if indices == DEFAULT_FRAME_INDICES and len(stored_steps) != 51:
         raise AssertionError("the default Job 762695 replay requires 51 frames")
     symbols = xyz_frames[0].get_chemical_symbols()
     if any(frame.get_chemical_symbols() != symbols for frame in xyz_frames):
         raise AssertionError("XYZ atom symbols differ between frames")
+    if not symbols or any(symbol != "Si" for symbol in symbols):
+        raise AssertionError("the fixed Si replay does not support other symbols")
 
-    frames = []
-    for index in indices:
-        stored_step = stored_steps[index]
-        if not isinstance(stored_step, dict) or "cell_angstrom" not in stored_step:
-            raise AssertionError("stored replay frame lacks its cell")
-        try:
-            json_cell = np.asarray(
-                stored_step["cell_angstrom"], dtype=np.float64)
-        except (TypeError, ValueError) as error:
-            raise AssertionError("stored replay cell must be numeric") from error
-        xyz_atoms = xyz_frames[index]
+    validated_frames = []
+    expected_identity = None
+    for index, (stored_step, xyz_atoms, xyz_record) in enumerate(zip(
+            stored_steps, xyz_frames, xyz_metadata)):
+        json_cell, identity = _validate_stored_frame(
+            stored_step, xyz_atoms, xyz_record, index, expected_identity)
+        if expected_identity is None:
+            expected_identity = identity
         atoms = xyz_atoms.copy()
         atoms.set_cell(json_cell, scale_atoms=False)
         atoms.set_pbc((True, True, True))
-        ase_validation.assert_valid_frame(json_cell, atoms.positions)
-        frames.append({
+        validated_frames.append({
             "index": index,
             "atoms": atoms,
             "stored_gpu": stored_step,
             "xyz_cell_max_abs_delta_angstrom": float(
-                np.max(np.abs(xyz_cells[index] - json_cell))),
+                np.max(np.abs(xyz_record["cell"] - json_cell))),
         })
+
+    frames = [validated_frames[index] for index in indices]
     return payload, frames
 
 

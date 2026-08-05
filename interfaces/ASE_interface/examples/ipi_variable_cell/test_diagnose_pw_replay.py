@@ -23,7 +23,9 @@ class ReplayFrameTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory(prefix="pw-replay-test-")
         self.directory = Path(self.temporary.name)
         self.result_json = self.directory / "result.json"
-        self.positions_xyz = self.directory / "positions.xyz"
+        self.socket_name = "abacus_vc_isotropic_test_123"
+        self.positions_xyz = self.directory / (
+            "isotropic-{}.positions_0.xyz".format(self.socket_name))
         self.xyz_positions = [
             np.array([[0.10 + 0.01 * index, 0.20, 0.30],
                       [2.70, 2.60 + 0.02 * index, 2.50]], dtype=np.float64)
@@ -42,6 +44,12 @@ class ReplayFrameTests(unittest.TestCase):
             "device": "gpu",
             "precision": "double",
             "trajectory": {
+                "mode": "isotropic",
+                "socket_name": self.socket_name,
+                "requested_steps": 5,
+                "completed_steps": 5,
+                "sample_count": 6,
+                "includes_initial_frame": True,
                 "steps": [self._stored_step(index) for index in range(6)]
             },
         }
@@ -52,17 +60,42 @@ class ReplayFrameTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def _stored_step(self, index):
+        cell = self.json_cells[index]
         return {
-            "cell_angstrom": self.json_cells[index].tolist(),
+            "executable_version": "v-source-gpu",
+            "executable_sha256": "c" * 64,
+            "source_commit": "d" * 40,
+            "module": "source/module",
+            "source": "official-ipi",
+            "backend": "pw",
+            "device": "gpu",
+            "precision": "double",
+            "precision_settings": {
+                "precision": "double",
+                "gint_precision": None,
+                "socket_float": "IEEE-754 binary64",
+            },
+            "cell_angstrom": cell.tolist(),
+            "volume_angstrom3": float(np.linalg.det(cell)),
+            "condition_number": float(np.linalg.cond(cell, 2)),
+            "scf_converged": True,
             "energy_ev": float(-10.0 + 0.01 * index),
+            "ipi_property_step": index,
+            "is_initial_frame": index == 0,
+            "atom_count": 2,
             "forces_ev_per_angstrom": [
                 [0.001 * index, 0.0, 0.0],
                 [-0.001 * index, 0.0, 0.0],
             ],
-            "ase_stress_ev_per_angstrom3": [
-                float(0.001 * (index + component))
-                for component in range(6)
-            ],
+            "raw_abacus_stress_kbar": np.zeros((3, 3)).tolist(),
+            "socket_virial_hartree": np.zeros((3, 3)).tolist(),
+            "ase_stress_ev_per_angstrom3": np.zeros(6).tolist(),
+            "thresholds": {
+                "active_stress": {
+                    "rtol": 0.0,
+                    "atol_ev_per_angstrom3": 0.0,
+                },
+            },
         }
 
     def _write_payload(self, payload):
@@ -88,6 +121,13 @@ class ReplayFrameTests(unittest.TestCase):
     def _replace_first_header(self, replacement):
         lines = self.positions_xyz.read_text().splitlines()
         lines[1] = replacement
+        self.positions_xyz.write_text("\n".join(lines) + "\n")
+
+    def _replace_header_text(self, frame_index, old, new):
+        lines = self.positions_xyz.read_text().splitlines()
+        header_index = 1 + 4 * frame_index
+        self.assertIn(old, lines[header_index])
+        lines[header_index] = lines[header_index].replace(old, new, 1)
         self.positions_xyz.write_text("\n".join(lines) + "\n")
 
     def test_parse_frame_indices_requires_unique_sorted_in_range_values(self):
@@ -143,6 +183,26 @@ class ReplayFrameTests(unittest.TestCase):
                 with self.assertRaises(AssertionError):
                     replay.load_replay_frames(
                         self.result_json, self.positions_xyz, (0, 1, 5))
+
+    def test_load_replay_frames_rejects_wrong_duplicate_or_out_of_order_step(self):
+        mutations = (
+            (0, "Step:           0", "Step:         999"),
+            (1, "Step:           1", "Step:           0"),
+            (2, "Step:           2", "Step:           3"),
+        )
+        for frame_index, old, new in mutations:
+            with self.subTest(frame_index=frame_index, new=new):
+                self._write_xyz(["Si2"] * 6)
+                self._replace_header_text(frame_index, old, new)
+                with self.assertRaises(AssertionError):
+                    replay.load_replay_frames(
+                        self.result_json, self.positions_xyz, (0, 1, 5))
+
+    def test_load_replay_frames_rejects_nonzero_bead(self):
+        self._replace_header_text(2, "Bead:       0", "Bead:       1")
+        with self.assertRaises(AssertionError):
+            replay.load_replay_frames(
+                self.result_json, self.positions_xyz, (0, 1, 5))
 
     def test_load_replay_frames_rejects_angles_outside_open_domain(self):
         cellpar = [5.43, 5.21921, 5.58486,
@@ -218,6 +278,79 @@ class ReplayFrameTests(unittest.TestCase):
 
     def test_load_replay_frames_rejects_atom_symbol_mismatch(self):
         self._write_xyz(["Si2", "Si2", "Si2", "Si2", "Si2", "SiC"])
+        with self.assertRaises(AssertionError):
+            replay.load_replay_frames(
+                self.result_json, self.positions_xyz, (0, 1, 5))
+
+    def test_load_replay_frames_rejects_unsupported_symbols(self):
+        self._write_xyz(["C2"] * 6)
+        with self.assertRaises(AssertionError):
+            replay.load_replay_frames(
+                self.result_json, self.positions_xyz, (0, 1, 5))
+
+    def test_load_replay_frames_requires_matching_positions_filename(self):
+        mismatched = self.directory / "unrelated.positions_0.xyz"
+        mismatched.write_bytes(self.positions_xyz.read_bytes())
+        with self.assertRaises(AssertionError):
+            replay.load_replay_frames(
+                self.result_json, mismatched, (0, 1, 5))
+
+    def test_load_replay_frames_rejects_inconsistent_trajectory_completion(self):
+        mutations = (
+            ("requested_steps", 4),
+            ("completed_steps", 4),
+            ("sample_count", 5),
+            ("includes_initial_frame", False),
+        )
+        for key, value in mutations:
+            with self.subTest(key=key):
+                payload = copy.deepcopy(self.payload)
+                payload["trajectory"][key] = value
+                self._write_payload(payload)
+                with self.assertRaises(AssertionError):
+                    replay.load_replay_frames(
+                        self.result_json, self.positions_xyz, (0, 1, 5))
+
+    def test_load_replay_frames_rejects_stored_step_sequence_and_initial_flag(self):
+        mutations = (
+            ("ipi_property_step", 999),
+            ("is_initial_frame", True),
+            ("ipi_property_step", 2.0),
+            ("is_initial_frame", 0),
+        )
+        for key, value in mutations:
+            with self.subTest(key=key):
+                payload = copy.deepcopy(self.payload)
+                # Frame 2 is deliberately not selected: all source frames must
+                # pass preflight before any replay process can be launched.
+                payload["trajectory"]["steps"][2][key] = value
+                self._write_payload(payload)
+                with self.assertRaises(AssertionError):
+                    replay.load_replay_frames(
+                        self.result_json, self.positions_xyz, (0, 1, 5))
+
+    def test_load_replay_frames_validates_every_stored_frame_schema_and_identity(self):
+        mutations = (
+            ("backend", "lcao"),
+            ("device", "cpu"),
+            ("precision", "single"),
+            ("scf_converged", False),
+            ("atom_count", 3),
+            ("executable_sha256", "e" * 64),
+        )
+        for key, value in mutations:
+            with self.subTest(key=key):
+                payload = copy.deepcopy(self.payload)
+                payload["trajectory"]["steps"][2][key] = value
+                self._write_payload(payload)
+                with self.assertRaises(AssertionError):
+                    replay.load_replay_frames(
+                        self.result_json, self.positions_xyz, (0, 1, 5))
+
+    def test_load_replay_frames_rejects_cellpar_outside_five_decimal_bound(self):
+        # Header cell 2 is not selected, so this also proves full-trajectory
+        # pairing is checked rather than only the replay subset.
+        self._replace_header_text(2, "5.43000", "5.43002")
         with self.assertRaises(AssertionError):
             replay.load_replay_frames(
                 self.result_json, self.positions_xyz, (0, 1, 5))
@@ -489,7 +622,9 @@ class ReplayOrchestrationTests(unittest.TestCase):
             prefix="pw-replay-orchestration-test-")
         self.directory = Path(self.temporary.name)
         self.validation_json = self.directory / "validation.json"
-        self.positions_xyz = self.directory / "positions.xyz"
+        self.socket_name = "abacus_vc_isotropic_test_456"
+        self.positions_xyz = self.directory / (
+            "isotropic-{}.positions_0.xyz".format(self.socket_name))
         self.pp_orb_root = self.directory / "PP_ORB"
         self.pp_orb_root.mkdir()
         (self.pp_orb_root / "Si_ONCV_PBE-1.2.upf").write_text(
@@ -510,7 +645,15 @@ class ReplayOrchestrationTests(unittest.TestCase):
             "backend": "pw",
             "device": "gpu",
             "precision": "double",
-            "trajectory": {"steps": self.steps},
+            "trajectory": {
+                "mode": "isotropic",
+                "socket_name": self.socket_name,
+                "requested_steps": 50,
+                "completed_steps": 50,
+                "sample_count": 51,
+                "includes_initial_frame": True,
+                "steps": self.steps,
+            },
         }
         self.validation_json.write_text(json.dumps(self.payload) + "\n")
         self._write_xyz()
@@ -530,20 +673,36 @@ class ReplayOrchestrationTests(unittest.TestCase):
     def _stored_step(self, index):
         energy = -10.0 + 0.001 * index
         return {
-            "source": "socket-trajectory",
+            "source": "official-ipi",
             "backend": "pw",
             "device": "gpu",
             "precision": "double",
+            "precision_settings": {
+                "precision": "double",
+                "gint_precision": None,
+                "socket_float": "IEEE-754 binary64",
+            },
             "scf_converged": True,
             "energy_ev": energy,
             "cell_angstrom": self.cell.tolist(),
+            "volume_angstrom3": float(np.linalg.det(self.cell)),
+            "condition_number": float(np.linalg.cond(self.cell, 2)),
+            "ipi_property_step": index,
+            "is_initial_frame": index == 0,
+            "atom_count": 2,
             "forces_ev_per_angstrom": [
                 [0.0001 * index, 0.0, 0.0],
                 [-0.0001 * index, 0.0, 0.0],
             ],
-            "ase_stress_ev_per_angstrom3": [
-                0.001 * (index + component) for component in range(6)
-            ],
+            "raw_abacus_stress_kbar": np.zeros((3, 3)).tolist(),
+            "socket_virial_hartree": np.zeros((3, 3)).tolist(),
+            "ase_stress_ev_per_angstrom3": np.zeros(6).tolist(),
+            "thresholds": {
+                "active_stress": {
+                    "rtol": 0.0,
+                    "atol_ev_per_angstrom3": 0.0,
+                },
+            },
             "executable_version": "v-source-gpu",
             "executable_sha256": "c" * 64,
             "source_commit": "d" * 40,
@@ -743,6 +902,20 @@ class ReplayOrchestrationTests(unittest.TestCase):
         serialized = json.loads(self.output.read_text())
         self.assertEqual(serialized, result)
         self.assertTrue(self.output.read_text().endswith("\n"))
+
+    def test_source_pairing_failures_happen_before_fresh_runner(self):
+        payload = copy.deepcopy(self.payload)
+        payload["trajectory"]["steps"][2]["ipi_property_step"] = 999
+        self.validation_json.write_text(json.dumps(payload) + "\n")
+        calls = []
+
+        with self.assertRaises(AssertionError):
+            replay.run_diagnostic(
+                replay.parse_args(self._argv()),
+                fresh_runner=self._fresh_runner(calls))
+
+        self.assertEqual(calls, [])
+        self.assertFalse(self.output.exists())
 
     def test_run_diagnostic_never_writes_partial_or_invalid_json(self):
         for invalid in ("unconverged", "nonfinite", "missing"):
