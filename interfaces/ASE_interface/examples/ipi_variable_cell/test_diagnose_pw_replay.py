@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 from ase import Atoms
+from ase.calculators.calculator import Calculator, all_changes
 
 from . import diagnose_pw_replay as replay
 
@@ -306,6 +309,426 @@ class ReplayDecisionTests(unittest.TestCase):
                 with self.assertRaises(AssertionError):
                     replay.classify_replay(cpu_gpu, stored_gpu, indices)
 
+
+class ReplayExecutionTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(
+            prefix="pw-replay-execution-test-")
+        self.directory = Path(self.temporary.name)
+        self.cpu_input = self.directory / "INPUT.cpu"
+        self.gpu_input = self.directory / "INPUT.gpu"
+        self.cpu_input.write_text(self._input_text("cpu"))
+        self.gpu_input.write_text(self._input_text("gpu"))
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    @staticmethod
+    def _input_text(device):
+        return "\n".join((
+            "INPUT_PARAMETERS",
+            "calculation scf",
+            "basis_type pw",
+            "device {}".format(device),
+            "precision double",
+            "ecutwfc 50",
+            "symmetry 0",
+            "kspacing 0.45",
+            "scf_thr 1e-09",
+            "scf_nmax 100",
+            "chg_extrap atomic",
+            "cal_force 1",
+            "cal_stress 1",
+            "",
+        ))
+
+    def write(self, name, text):
+        path = self.directory / name
+        path.write_text(text)
+        return path
+
+    def test_parse_raw_total_energy_requires_exactly_one_value(self):
+        log = self.write(
+            "running_scf.log", "#TOTAL ENERGY# -206.48515779761 eV\n")
+        self.assertEqual(
+            replay.parse_raw_total_energy(log), -206.48515779761)
+        invalid_logs = (
+            "",
+            "#TOTAL ENERGY# -1 eV\n#TOTAL ENERGY# -2 eV\n",
+            "#TOTAL ENERGY# nan eV\n",
+            "!FINAL_ETOT_IS -3 eV\nE_KS(sigma->0) -4 eV\n",
+        )
+        for text in invalid_logs:
+            with self.subTest(text=text):
+                log.write_text(text)
+                with self.assertRaises(AssertionError):
+                    replay.parse_raw_total_energy(log)
+
+    def test_paired_inputs_differ_only_by_device(self):
+        replay.assert_paired_inputs(self.cpu_input, self.gpu_input)
+        self.gpu_input.write_text(
+            self.gpu_input.read_text() + "socket_driver 1\n")
+        with self.assertRaises(AssertionError):
+            replay.assert_paired_inputs(self.cpu_input, self.gpu_input)
+
+    def test_paired_inputs_reject_socket_and_wrong_required_fields(self):
+        mutations = (
+            (self.cpu_input, "cal_stress 1", "cal_stress 0"),
+            (self.gpu_input, "basis_type pw", "basis_type lcao"),
+            (self.cpu_input, "scf_thr 1e-09", "scf_thr 1e-08"),
+            (self.gpu_input, "cal_force 1", "cal_force 0"),
+            (self.cpu_input, "", "socket_variable_cell 1\n"),
+        )
+        for path, old, new in mutations:
+            with self.subTest(path=path.name, new=new):
+                self.cpu_input.write_text(self._input_text("cpu"))
+                self.gpu_input.write_text(self._input_text("gpu"))
+                path.write_text(path.read_text().replace(old, new, 1))
+                with self.assertRaises(AssertionError):
+                    replay.assert_paired_inputs(
+                        self.cpu_input, self.gpu_input)
+
+    def test_run_fresh_frame_uses_raw_energy_and_one_device_frame(self):
+        class FakeProfile:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        class FakeAbacus(Calculator):
+            implemented_properties = ["energy", "forces", "stress"]
+            banner_device = "GPU"
+            extra_frame = False
+
+            def __init__(self, profile, directory, **kwargs):
+                super().__init__()
+                self.directory = Path(directory)
+                self.device = kwargs["inp"]["device"]
+
+            def calculate(self, atoms=None, properties=None,
+                          system_changes=all_changes):
+                super().calculate(atoms, properties, system_changes)
+                directory = Path(self.directory)
+                directory.mkdir(parents=True, exist_ok=True)
+                (directory / "INPUT").write_text(
+                    ReplayExecutionTests._input_text(self.device))
+                output = directory / "OUT.ABACUS"
+                output.mkdir()
+                text = (
+                    " RUNNING WITH DEVICE  : {} / fake-device (x1)\n".format(
+                        type(self).banner_device) +
+                    (
+                    " #SCF IS CONVERGED#\n"
+                    " #TOTAL ENERGY# -10.25 eV\n"
+                    " #TOTAL-STRESS (kbar)#\n"
+                    " 1 0 0\n 0 1 0\n 0 0 1\n"))
+                if type(self).extra_frame:
+                    text += (
+                        " #SCF IS CONVERGED#\n"
+                        " #TOTAL ENERGY# -10.24 eV\n"
+                        " #TOTAL-STRESS (kbar)#\n"
+                        " 1 0 0\n 0 1 0\n 0 0 1\n")
+                (output / "running_scf.log").write_text(text)
+                self.results = {
+                    "energy": -10.0,
+                    "forces": np.zeros((len(atoms), 3)),
+                    "stress": np.zeros(6),
+                }
+
+        config = replay.ase_validation.Config(
+            "fake-abacus", "pw", "gpu", "double",
+            self.directory / "configured-gpu", self.directory / "unused.json",
+            self.directory)
+        atoms = Atoms("Si2", positions=[[0, 0, 0], [1, 1, 1]],
+                      cell=np.eye(3) * 5.0, pbc=True)
+        case = self.directory / "fresh-gpu"
+        identity = {
+            "executable_version": "v-test",
+            "executable_sha256": "a" * 64,
+            "source_commit": "b" * 40,
+            "module": "test/module",
+        }
+        with mock.patch.object(
+                replay.ase_validation, "_load_abacus_api",
+                return_value=(FakeAbacus, FakeProfile, object)), \
+                mock.patch.object(
+                    replay.ase_validation, "_identity",
+                    return_value=identity):
+            record = replay.run_fresh_frame(config, atoms, case)
+
+        self.assertEqual(record["energy_ev"], -10.25)
+        self.assertEqual(record["fileio_energy_ev"], -10.0)
+        self.assertEqual(
+            record["energy_provenance"],
+            "running_scf.log #TOTAL ENERGY#")
+        self.assertTrue(record["scf_converged"])
+        self.assertEqual(record["device"], "gpu")
+        replay.run_validation.assert_json_ready(record)
+        with self.assertRaises(AssertionError):
+            replay.run_fresh_frame(config, atoms, case)
+
+        for banner_device, extra_frame, name in (
+                ("CPU", False, "wrong-device"),
+                ("GPU", True, "multiple-frames")):
+            with self.subTest(name=name):
+                FakeAbacus.banner_device = banner_device
+                FakeAbacus.extra_frame = extra_frame
+                with mock.patch.object(
+                        replay.ase_validation, "_load_abacus_api",
+                        return_value=(FakeAbacus, FakeProfile, object)), \
+                        mock.patch.object(
+                            replay.ase_validation, "_identity",
+                            return_value=identity):
+                    with self.assertRaises(AssertionError):
+                        replay.run_fresh_frame(
+                            config, atoms, self.directory / name)
+
+
+class ReplayOrchestrationTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(
+            prefix="pw-replay-orchestration-test-")
+        self.directory = Path(self.temporary.name)
+        self.validation_json = self.directory / "validation.json"
+        self.positions_xyz = self.directory / "positions.xyz"
+        self.pp_orb_root = self.directory / "PP_ORB"
+        self.pp_orb_root.mkdir()
+        (self.pp_orb_root / "Si_ONCV_PBE-1.2.upf").write_text(
+            "synthetic pseudopotential\n")
+        self.cpu_abacus = self._write_executable(
+            "cpu-abacus", "v-test-cpu")
+        self.gpu_abacus = self._write_executable(
+            "gpu-abacus", "v-test-gpu")
+        self.cell = np.array([
+            [5.43, 0.31, 0.17],
+            [0.00, 5.21, 0.37],
+            [0.00, 0.00, 5.57],
+        ], dtype=np.float64)
+        self.steps = [self._stored_step(index) for index in range(51)]
+        self.payload = {
+            "schema_version": 1,
+            "ipi_version": "3.2.0",
+            "backend": "pw",
+            "device": "gpu",
+            "precision": "double",
+            "trajectory": {"steps": self.steps},
+        }
+        self.validation_json.write_text(json.dumps(self.payload) + "\n")
+        self._write_xyz()
+        self.workdir = self.directory / "work"
+        self.output = self.directory / "diagnostic.json"
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def _write_executable(self, name, version):
+        path = self.directory / name
+        path.write_text(
+            "#!/bin/sh\necho 'ABACUS version {}'\n".format(version))
+        path.chmod(0o755)
+        return path
+
+    def _stored_step(self, index):
+        energy = -10.0 + 0.001 * index
+        return {
+            "source": "socket-trajectory",
+            "backend": "pw",
+            "device": "gpu",
+            "precision": "double",
+            "scf_converged": True,
+            "energy_ev": energy,
+            "cell_angstrom": self.cell.tolist(),
+            "forces_ev_per_angstrom": [
+                [0.0001 * index, 0.0, 0.0],
+                [-0.0001 * index, 0.0, 0.0],
+            ],
+            "ase_stress_ev_per_angstrom3": [
+                0.001 * (index + component) for component in range(6)
+            ],
+            "executable_version": "v-source-gpu",
+            "executable_sha256": "c" * 64,
+            "source_commit": "d" * 40,
+            "module": "source/module",
+        }
+
+    def _write_xyz(self):
+        lines = []
+        for index in range(51):
+            lines.extend([
+                "2",
+                ("# CELL(abcABC): 5.43 5.21921 5.58486 "
+                 "86.10424 88.25568 86.59486 Step: {} Bead: 0 "
+                 "positions{{angstrom}} cell{{angstrom}}".format(index)),
+                "Si {:.8f} 0.20000000 0.30000000".format(
+                    0.1 + 0.001 * index),
+                "Si 2.70000000 {:.8f} 2.50000000".format(
+                    2.6 + 0.001 * index),
+            ])
+        self.positions_xyz.write_text("\n".join(lines) + "\n")
+
+    def _argv(self, workdir=None, output=None):
+        return [
+            "--validation-json", str(self.validation_json),
+            "--positions", str(self.positions_xyz),
+            "--cpu-abacus", str(self.cpu_abacus),
+            "--gpu-abacus", str(self.gpu_abacus),
+            "--pp-orb-root", str(self.pp_orb_root),
+            "--frames", "0,1,5,8,42,50",
+            "--workdir", str(workdir or self.workdir),
+            "--output", str(output or self.output),
+        ]
+
+    def _fresh_runner(self, calls, invalid=None):
+        def fresh_runner(config, atoms, directory):
+            directory = Path(directory)
+            self.assertFalse(directory.exists())
+            directory.mkdir(parents=True)
+            (directory / "INPUT").write_text(
+                ReplayExecutionTests._input_text(config.device))
+            index = int(directory.name.split("-")[1])
+            calls.append({
+                "index": index,
+                "device": config.device,
+                "directory": str(directory.resolve()),
+                "config_workdir": str(config.workdir.resolve()),
+                "cell": atoms.cell.array.copy(),
+                "positions": atoms.positions.copy(),
+            })
+            record = copy.deepcopy(self.steps[index])
+            record.update({
+                "source": "fileio",
+                "device": config.device,
+                "cell_angstrom": atoms.cell.array.tolist(),
+                "fileio_energy_ev": record["energy_ev"] + 0.125,
+                "energy_provenance": "running_scf.log #TOTAL ENERGY#",
+            })
+            if invalid == "unconverged" and len(calls) == 4:
+                record["scf_converged"] = False
+            elif invalid == "nonfinite" and len(calls) == 4:
+                record["energy_ev"] = float("nan")
+            elif invalid == "missing" and len(calls) == 4:
+                record.pop("forces_ev_per_angstrom")
+            return record
+        return fresh_runner
+
+    def test_cli_parses_all_required_diagnostic_paths(self):
+        args = replay.parse_args(self._argv())
+        self.assertEqual(args.validation_json, self.validation_json)
+        self.assertEqual(args.positions, self.positions_xyz)
+        self.assertEqual(args.cpu_abacus, self.cpu_abacus)
+        self.assertEqual(args.gpu_abacus, self.gpu_abacus)
+        self.assertEqual(args.pp_orb_root, self.pp_orb_root)
+        self.assertEqual(args.frames, "0,1,5,8,42,50")
+        self.assertEqual(args.workdir, self.workdir)
+        self.assertEqual(args.output, self.output)
+
+    def test_run_diagnostic_records_twelve_fresh_paired_cases(self):
+        stale = self.workdir / "frame-000-cpu"
+        stale.mkdir(parents=True)
+        (stale / "stale").write_text("remove only this case\n")
+        calls = []
+
+        result = replay.run_diagnostic(
+            replay.parse_args(self._argv()),
+            fresh_runner=self._fresh_runner(calls))
+
+        expected_order = [
+            (index, device)
+            for index in replay.DEFAULT_FRAME_INDICES
+            for device in ("cpu", "gpu")
+        ]
+        self.assertEqual(
+            [(call["index"], call["device"]) for call in calls],
+            expected_order)
+        self.assertEqual(len({call["directory"] for call in calls}), 12)
+        for pair in range(0, len(calls), 2):
+            np.testing.assert_array_equal(
+                calls[pair]["cell"], calls[pair + 1]["cell"])
+            np.testing.assert_array_equal(
+                calls[pair]["positions"], calls[pair + 1]["positions"])
+            self.assertTrue(calls[pair]["config_workdir"].endswith("/cpu"))
+            self.assertTrue(calls[pair + 1]["config_workdir"].endswith("/gpu"))
+
+        self.assertEqual(result["schema_version"], 1)
+        self.assertEqual(
+            result["kind"], "gpu-pw-socket-replay-diagnostic")
+        self.assertEqual(
+            result["selected_frames"], list(replay.DEFAULT_FRAME_INDICES))
+        self.assertEqual(
+            result["classification"],
+            "trajectory_geometry_explains_difference")
+        self.assertEqual(
+            result["thresholds"],
+            replay.ase_validation.IDENTICAL_DOUBLE_LIMITS)
+        self.assertEqual(
+            result["source_validation"]["validation_json_path"],
+            str(self.validation_json.resolve()))
+        self.assertEqual(
+            result["source_validation"]["validation_json_sha256"],
+            hashlib.sha256(self.validation_json.read_bytes()).hexdigest())
+        self.assertEqual(
+            result["source_validation"]["positions_sha256"],
+            hashlib.sha256(self.positions_xyz.read_bytes()).hexdigest())
+        self.assertEqual(
+            result["source_validation"]["source_identity"]["source_commit"],
+            "d" * 40)
+        self.assertEqual(
+            result["cpu_identity"]["executable_version"], "v-test-cpu")
+        self.assertEqual(
+            result["gpu_identity"]["executable_version"], "v-test-gpu")
+        self.assertEqual(
+            result["cpu_identity"]["executable_path"],
+            str(self.cpu_abacus.resolve()))
+        self.assertEqual(
+            result["gpu_identity"]["executable_path"],
+            str(self.gpu_abacus.resolve()))
+        self.assertEqual(
+            result["cpu_identity"]["executable_sha256"],
+            hashlib.sha256(self.cpu_abacus.read_bytes()).hexdigest())
+        self.assertEqual(
+            result["pseudopotential"]["sha256"],
+            hashlib.sha256(
+                (self.pp_orb_root / "Si_ONCV_PBE-1.2.upf").read_bytes()
+            ).hexdigest())
+
+        self.assertEqual(len(result["frames"]), 6)
+        for frame, index in zip(
+                result["frames"], replay.DEFAULT_FRAME_INDICES):
+            self.assertEqual(frame["index"], index)
+            self.assertEqual(
+                frame["source_positions_path"],
+                str(self.positions_xyz.resolve()))
+            self.assertEqual(
+                frame["cpu_case_path"],
+                str((self.workdir / "frame-{:03d}-cpu".format(
+                    index)).resolve()))
+            self.assertEqual(
+                frame["gpu_case_path"],
+                str((self.workdir / "frame-{:03d}-gpu".format(
+                    index)).resolve()))
+            self.assertTrue(frame["fresh_cpu_gpu_decision"]["pass"])
+            self.assertTrue(frame["stored_gpu_fresh_gpu_decision"]["pass"])
+            self.assertEqual(
+                frame["fresh_gpu"]["energy_provenance"],
+                "running_scf.log #TOTAL ENERGY#")
+            self.assertIn("fileio_energy_ev", frame["fresh_cpu"])
+            self.assertIn("stored_gpu", frame)
+
+        replay.run_validation.assert_json_ready(result)
+        serialized = json.loads(self.output.read_text())
+        self.assertEqual(serialized, result)
+        self.assertTrue(self.output.read_text().endswith("\n"))
+
+    def test_run_diagnostic_never_writes_partial_or_invalid_json(self):
+        for invalid in ("unconverged", "nonfinite", "missing"):
+            with self.subTest(invalid=invalid):
+                workdir = self.directory / ("work-" + invalid)
+                output = self.directory / ("output-" + invalid + ".json")
+                calls = []
+                with self.assertRaises(AssertionError):
+                    replay.run_diagnostic(
+                        replay.parse_args(self._argv(workdir, output)),
+                        fresh_runner=self._fresh_runner(calls, invalid))
+                self.assertFalse(output.exists())
+                self.assertEqual(len(calls), 4)
 
 if __name__ == "__main__":
     unittest.main()

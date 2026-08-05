@@ -2,7 +2,13 @@
 """Replay saved GPU PW socket frames through fresh ABACUS calculations."""
 from __future__ import annotations
 
+import argparse
+import copy
+import hashlib
 import json
+import re
+import shlex
+import shutil
 import sys
 from pathlib import Path
 
@@ -209,3 +215,398 @@ def classify_replay(cpu_gpu: list[dict], stored_gpu: list[dict],
     if all(decision["pass"] for decision in stored_gpu):
         return "trajectory_geometry_explains_difference"
     return "inconclusive"
+
+_RAW_TOTAL_ENERGY = re.compile(
+    r"^\s*#TOTAL ENERGY#\s+"
+    r"([-+]?(?:\d+\.?\d*|\.\d+)(?:[Ee][-+]?\d+)?)\s+eV\s*$",
+    flags=re.MULTILINE)
+_REQUIRED_INPUT_VALUES = {
+    "calculation": "scf",
+    "basis_type": "pw",
+    "precision": "double",
+    "chg_extrap": "atomic",
+}
+_REQUIRED_INPUT_NUMBERS = {
+    "ecutwfc": 50.0,
+    "kspacing": 0.45,
+    "scf_thr": 1.0e-9,
+    "scf_nmax": 100.0,
+    "cal_force": 1.0,
+    "cal_stress": 1.0,
+}
+_SOCKET_INPUT_KEYWORDS = ("socket_driver", "socket_variable_cell")
+
+
+def parse_raw_total_energy(log_path: Path) -> float:
+    """Return the unique finite socket-equivalent raw ABACUS energy."""
+    path = Path(log_path)
+    if not path.is_file():
+        raise AssertionError("ABACUS running_scf.log is absent")
+    matches = _RAW_TOTAL_ENERGY.findall(path.read_text(errors="replace"))
+    if len(matches) != 1:
+        raise AssertionError(
+            "running_scf.log must contain exactly one raw total energy")
+    energy = float(matches[0])
+    if not np.isfinite(energy):
+        raise AssertionError("raw total energy must be finite")
+    return energy
+
+
+def _paired_input_fields(text: str) -> dict[str, str]:
+    if not isinstance(text, str):
+        raise AssertionError("ABACUS INPUT must be text")
+    if any(re.search(r"\b{}\b".format(keyword), text, re.IGNORECASE)
+           for keyword in _SOCKET_INPUT_KEYWORDS):
+        raise AssertionError("fresh replay INPUT must not contain socket keywords")
+    fields: dict[str, str] = {}
+    for line in text.splitlines():
+        stripped = line.strip()
+        if (not stripped or stripped.upper() == "INPUT_PARAMETERS"
+                or stripped.startswith("#")):
+            continue
+        tokens = stripped.split()
+        if len(tokens) < 2:
+            continue
+        key = tokens[0].lower()
+        value = " ".join(tokens[1:])
+        if key in fields:
+            raise AssertionError("ABACUS INPUT repeats {}".format(key))
+        fields[key] = value
+    for key, expected in _REQUIRED_INPUT_VALUES.items():
+        if fields.get(key, "").lower() != expected:
+            raise AssertionError(
+                "fresh replay INPUT requires {} {}".format(key, expected))
+    for key, expected in _REQUIRED_INPUT_NUMBERS.items():
+        try:
+            actual = float(fields[key])
+        except (KeyError, ValueError) as error:
+            raise AssertionError(
+                "fresh replay INPUT requires numeric {}".format(key)) from error
+        if not np.isfinite(actual) or actual != expected:
+            raise AssertionError(
+                "fresh replay INPUT has wrong {}".format(key))
+    device = fields.get("device", "").lower()
+    if device not in ("cpu", "gpu"):
+        raise AssertionError("fresh replay INPUT requires cpu or gpu device")
+    return fields
+
+
+def normalize_paired_input(text: str) -> str:
+    """Validate a fresh PW/double INPUT and mask its one device value."""
+    fields = _paired_input_fields(text)
+    device_pattern = re.compile(
+        r"^(\s*device\s+){}(\s*)$".format(re.escape(fields["device"])),
+        flags=re.MULTILINE | re.IGNORECASE)
+    normalized, count = device_pattern.subn(r"\1<device>\2", text)
+    if count != 1:
+        raise AssertionError("fresh replay INPUT must declare device once")
+    return normalized
+
+
+def assert_paired_inputs(cpu_input: Path, gpu_input: Path) -> None:
+    """Require fresh CPU/GPU INPUT files to differ only by device."""
+    cpu_text = Path(cpu_input).read_text()
+    gpu_text = Path(gpu_input).read_text()
+    if _paired_input_fields(cpu_text)["device"].lower() != "cpu":
+        raise AssertionError("CPU replay INPUT does not request device cpu")
+    if _paired_input_fields(gpu_text)["device"].lower() != "gpu":
+        raise AssertionError("GPU replay INPUT does not request device gpu")
+    if normalize_paired_input(cpu_text) != normalize_paired_input(gpu_text):
+        raise AssertionError("CPU/GPU replay INPUT files differ beyond device")
+
+
+def _assert_requested_device(log_path: Path, device: str) -> None:
+    text = Path(log_path).read_text(errors="replace")
+    banner = re.compile(
+        r"^\s*(?:RUNNING WITH DEVICE\s*:\s*)?{}\s*/".format(
+            re.escape(device)),
+        flags=re.MULTILINE | re.IGNORECASE)
+    if banner.search(text) is None:
+        raise AssertionError(
+            "ABACUS log lacks requested {} device banner".format(device))
+
+
+def run_fresh_frame(config: ase_validation.Config, atoms,
+                    directory: Path) -> dict:
+    """Run one isolated non-socket FileIO SCF and record raw replay energy."""
+    directory = Path(directory)
+    if directory.exists():
+        raise AssertionError("fresh replay directory already exists")
+    if (config.basis != "pw" or config.precision != "double"
+            or config.device not in ("cpu", "gpu")):
+        raise AssertionError("fresh replay requires CPU/GPU PW/double config")
+    ase_validation.assert_valid_frame(
+        np.asarray(atoms.cell, dtype=np.float64),
+        np.asarray(atoms.positions, dtype=np.float64))
+    Abacus, _, _ = ase_validation._load_abacus_api()
+    fresh = atoms.copy()
+    fresh.calc = Abacus(
+        profile=ase_validation._profile(config), directory=directory,
+        **ase_validation._common_kwargs(config))
+    fileio_energy = float(fresh.get_potential_energy())
+    fresh.get_forces()
+    fresh.get_stress()
+    logs = sorted(directory.glob("OUT.*/running_scf.log"))
+    if len(logs) != 1:
+        raise AssertionError(
+            "fresh replay must produce exactly one running_scf.log")
+    log_path = logs[0]
+    ase_validation.raw_frame_series(directory, expected_frames=1)
+    _assert_requested_device(log_path, config.device)
+    record = ase_validation._frame_record(
+        config, ase_validation._identity(config), fresh, directory, "fileio")
+    record["fileio_energy_ev"] = fileio_energy
+    record["energy_ev"] = parse_raw_total_energy(log_path)
+    record["energy_provenance"] = "running_scf.log #TOTAL ENERGY#"
+    if record.get("scf_converged") is not True:
+        raise AssertionError("fresh replay SCF did not converge")
+    run_validation.assert_json_ready(record)
+    return record
+
+
+_SOURCE_IDENTITY_KEYS = (
+    "executable_version", "executable_sha256", "source_commit", "module")
+
+
+def _sha256_file(path: Path) -> str:
+    path = Path(path)
+    if not path.is_file():
+        raise AssertionError("required input file is absent: {}".format(path))
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _executable_path(command: str) -> Path:
+    try:
+        tokens = shlex.split(command)
+    except ValueError as error:
+        raise AssertionError("ABACUS command is invalid") from error
+    for token in reversed(tokens):
+        candidate = shutil.which(token)
+        if candidate is not None and "abacus" in Path(candidate).name.lower():
+            path = Path(candidate).resolve()
+            if not path.is_file():
+                break
+            return path
+    raise AssertionError("cannot resolve ABACUS executable path")
+
+
+def _diagnostic_identity(config: ase_validation.Config) -> dict:
+    identity = copy.deepcopy(ase_validation._identity(config))
+    executable = _executable_path(config.abacus)
+    digest = _sha256_file(executable)
+    if identity.get("executable_sha256") != digest:
+        raise AssertionError("ABACUS executable identity hash is inconsistent")
+    identity.update({
+        "command": config.abacus,
+        "executable_path": str(executable),
+    })
+    run_validation.assert_json_ready(identity)
+    return identity
+
+
+def _source_identity(frames: list[dict]) -> dict:
+    if not frames:
+        raise AssertionError("source replay frames are absent")
+    identity = {
+        key: frames[0]["stored_gpu"].get(key)
+        for key in _SOURCE_IDENTITY_KEYS
+    }
+    if (not all(isinstance(identity[key], str)
+                for key in _SOURCE_IDENTITY_KEYS)
+            or not identity["executable_version"]
+            or re.fullmatch(r"[0-9a-fA-F]{64}",
+                            identity["executable_sha256"]) is None
+            or re.fullmatch(r"[0-9a-fA-F]{40}",
+                            identity["source_commit"]) is None):
+        raise AssertionError("source validation identity is incomplete")
+    for frame in frames[1:]:
+        if any(frame["stored_gpu"].get(key) != identity[key]
+               for key in _SOURCE_IDENTITY_KEYS):
+            raise AssertionError("source frame identities are inconsistent")
+    identity["executable_sha256"] = identity["executable_sha256"].lower()
+    identity["source_commit"] = identity["source_commit"].lower()
+    return identity
+
+
+def _validate_fresh_record(
+        record: dict, config: ase_validation.Config) -> None:
+    run_validation.assert_json_ready(record)
+    required = (
+        "source", "backend", "device", "precision", "scf_converged",
+        "energy_ev", "fileio_energy_ev", "energy_provenance",
+        "cell_angstrom", "forces_ev_per_angstrom",
+        "ase_stress_ev_per_angstrom3")
+    if not isinstance(record, dict) or any(
+            key not in record for key in required):
+        raise AssertionError("fresh replay record is incomplete")
+    if (record["source"] != "fileio"
+            or record["backend"] != "pw"
+            or record["device"] != config.device
+            or record["precision"] != "double"
+            or record["scf_converged"] is not True
+            or record["energy_provenance"]
+            != "running_scf.log #TOTAL ENERGY#"):
+        raise AssertionError("fresh replay record identity or convergence is invalid")
+    fileio_energy = record["fileio_energy_ev"]
+    if (isinstance(fileio_energy, bool)
+            or not np.isscalar(fileio_energy)
+            or not np.isfinite(fileio_energy)):
+        raise AssertionError("fresh FileIO energy must be a finite scalar")
+    cell = np.asarray(record["cell_angstrom"], dtype=np.float64)
+    forces = np.asarray(record["forces_ev_per_angstrom"], dtype=np.float64)
+    ase_validation.assert_valid_frame(cell, np.empty((0, 3)))
+    if forces.ndim != 2 or forces.shape[1:] != (3,) or not forces.size:
+        raise AssertionError("fresh replay forces are invalid")
+    compare_records(record, record)
+
+
+def _reset_case_directory(
+        workdir: Path, case: Path, used: set[Path]) -> None:
+    root = workdir.resolve()
+    resolved = case.resolve()
+    if resolved.parent != root or resolved in used:
+        raise AssertionError("fresh replay case path is unsafe or reused")
+    if case.is_symlink():
+        raise AssertionError("fresh replay case path must not be a symlink")
+    if case.exists():
+        shutil.rmtree(case)
+    used.add(resolved)
+
+
+def parse_args(argv=None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Replay stored GPU PW socket frames as fresh CPU/GPU SCFs")
+    parser.add_argument("--validation-json", type=Path, required=True)
+    parser.add_argument("--positions", type=Path, required=True)
+    parser.add_argument("--cpu-abacus", type=Path, required=True)
+    parser.add_argument("--gpu-abacus", type=Path, required=True)
+    parser.add_argument("--pp-orb-root", type=Path, required=True)
+    parser.add_argument(
+        "--frames",
+        default=",".join(str(index) for index in DEFAULT_FRAME_INDICES))
+    parser.add_argument("--workdir", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    return parser.parse_args(argv)
+
+
+def run_diagnostic(
+        args: argparse.Namespace, fresh_runner=run_fresh_frame) -> dict:
+    """Run all selected fresh replays and write one transactional manifest."""
+    validation_json = Path(args.validation_json).resolve()
+    positions = Path(args.positions).resolve()
+    cpu_abacus = Path(args.cpu_abacus).resolve()
+    gpu_abacus = Path(args.gpu_abacus).resolve()
+    pp_orb_root = Path(args.pp_orb_root).resolve()
+    workdir = Path(args.workdir).resolve()
+    output = Path(args.output).resolve()
+    if output.exists():
+        raise AssertionError("refusing to overwrite diagnostic output")
+    source_hash = _sha256_file(validation_json)
+    positions_hash = _sha256_file(positions)
+    pseudopotential = pp_orb_root / "Si_ONCV_PBE-1.2.upf"
+    pseudopotential_hash = _sha256_file(pseudopotential)
+
+    source_preview = json.loads(validation_json.read_text())
+    run_validation.assert_json_ready(source_preview)
+    try:
+        frame_count = len(source_preview["trajectory"]["steps"])
+    except (KeyError, TypeError) as error:
+        raise AssertionError("source validation trajectory is incomplete") from error
+    indices = parse_frame_indices(args.frames, frame_count)
+    payload, replay_frames = load_replay_frames(
+        validation_json, positions, indices)
+
+    cpu_config = ase_validation.Config(
+        str(cpu_abacus), "pw", "cpu", "double", workdir / "cpu",
+        output, pp_orb_root)
+    gpu_config = ase_validation.Config(
+        str(gpu_abacus), "pw", "gpu", "double", workdir / "gpu",
+        output, pp_orb_root)
+    cpu_identity = _diagnostic_identity(cpu_config)
+    gpu_identity = _diagnostic_identity(gpu_config)
+    source_identity = _source_identity(replay_frames)
+
+    workdir.mkdir(parents=True, exist_ok=True)
+    used: set[Path] = set()
+    frame_records = []
+    cpu_gpu_decisions = []
+    stored_gpu_decisions = []
+    for replay_frame in replay_frames:
+        index = replay_frame["index"]
+        atoms = replay_frame["atoms"]
+        cpu_case = workdir / "frame-{:03d}-cpu".format(index)
+        gpu_case = workdir / "frame-{:03d}-gpu".format(index)
+        _reset_case_directory(workdir, cpu_case, used)
+        fresh_cpu = fresh_runner(cpu_config, atoms, cpu_case)
+        _validate_fresh_record(fresh_cpu, cpu_config)
+        if not (cpu_case / "INPUT").is_file():
+            raise AssertionError("fresh CPU replay INPUT is absent")
+
+        _reset_case_directory(workdir, gpu_case, used)
+        fresh_gpu = fresh_runner(gpu_config, atoms, gpu_case)
+        _validate_fresh_record(fresh_gpu, gpu_config)
+        if not (gpu_case / "INPUT").is_file():
+            raise AssertionError("fresh GPU replay INPUT is absent")
+        assert_paired_inputs(cpu_case / "INPUT", gpu_case / "INPUT")
+
+        cpu_gpu = compare_records(fresh_cpu, fresh_gpu)
+        stored_gpu = compare_records(fresh_gpu, replay_frame["stored_gpu"])
+        cpu_gpu_decisions.append(cpu_gpu)
+        stored_gpu_decisions.append(stored_gpu)
+        frame_records.append({
+            "index": index,
+            "source_positions_path": str(positions),
+            "source_validation_path": str(validation_json),
+            "cpu_case_path": str(cpu_case),
+            "gpu_case_path": str(gpu_case),
+            "xyz_cell_max_abs_delta_angstrom":
+                replay_frame["xyz_cell_max_abs_delta_angstrom"],
+            "fresh_cpu": fresh_cpu,
+            "fresh_gpu": fresh_gpu,
+            "stored_gpu": replay_frame["stored_gpu"],
+            "fresh_cpu_gpu_decision": cpu_gpu,
+            "stored_gpu_fresh_gpu_decision": stored_gpu,
+        })
+
+    classification = classify_replay(
+        cpu_gpu_decisions, stored_gpu_decisions, indices)
+    result = {
+        "schema_version": 1,
+        "kind": "gpu-pw-socket-replay-diagnostic",
+        "source_validation": {
+            "validation_json_path": str(validation_json),
+            "validation_json_sha256": source_hash,
+            "positions_path": str(positions),
+            "positions_sha256": positions_hash,
+            "ipi_version": payload["ipi_version"],
+            "backend": payload["backend"],
+            "device": payload["device"],
+            "precision": payload["precision"],
+            "source_identity": source_identity,
+        },
+        "selected_frames": list(indices),
+        "cpu_identity": cpu_identity,
+        "gpu_identity": gpu_identity,
+        "pseudopotential": {
+            "path": str(pseudopotential.resolve()),
+            "sha256": pseudopotential_hash,
+        },
+        "frames": frame_records,
+        "classification": classification,
+        "thresholds": copy.deepcopy(
+            ase_validation.IDENTICAL_DOUBLE_LIMITS),
+    }
+    run_validation.assert_json_ready(result)
+    text = json.dumps(result, indent=2, allow_nan=False) + "\n"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(text)
+    return result
+
+
+def main(argv=None) -> int:
+    run_diagnostic(parse_args(argv))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

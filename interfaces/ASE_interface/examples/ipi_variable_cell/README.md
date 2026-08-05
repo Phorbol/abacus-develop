@@ -110,3 +110,44 @@ equilibration. Double precision is the reference. Single/mixed precision uses
 looser smoke thresholds for identical-frame, finite-difference, filter, and
 pressure-offset significance decisions. It must still preserve sign, layout,
 and finite behavior, but it does not establish reference values.
+
+## Fresh GPU PW replay diagnostic
+
+`diagnose_pw_replay.py` replays the selected geometries from one completed
+i-PI 3.2 GPU/PW/double validation as independent non-socket CPU and GPU
+PW/double SCFs. Every frame/device pair uses a new case directory and ABACUS
+process. Run the staged diagnostic with the full interface:
+
+```bash
+OMP_NUM_THREADS=1 /home/gengjianrui/bin/abacus-variable-cell-runtime/venv/bin/python \
+  diagnose_pw_replay.py \
+  --validation-json /path/to/gpu-pw-isotropic-result.json \
+  --positions /path/to/matching.positions_0.xyz \
+  --cpu-abacus /path/to/abacus_basic_para \
+  --gpu-abacus /path/to/abacus_basic_gpu \
+  --pp-orb-root /path/to/PP_ORB \
+  --frames 0,1,5,8,42,50 \
+  --workdir /path/to/fresh-replay-work \
+  --output /path/to/gpu-pw-replay.json
+```
+
+The replay energy is exactly one finite raw
+`#TOTAL ENERGY# ... eV` value from each fresh
+`OUT.*/running_scf.log`. That is the Kohn-Sham free-energy quantity used by
+the socket comparison. ASE FileIO may instead report `E_KS(sigma->0)`;
+the diagnostic records that separately as `fileio_energy_ev` and never
+substitutes it for the raw replay energy.
+
+The output applies the existing PW/double identical-frame thresholds in this
+fixed order:
+
+- `general_gpu_backend_difference`: at least one fresh CPU/GPU pair differs.
+- `continuous_socket_state_suspected`: all fresh CPU/GPU pairs agree, saved
+  GPU step 0 agrees with its fresh GPU replay, and at least one later saved GPU
+  frame differs from its fresh replay.
+- `trajectory_geometry_explains_difference`: all fresh CPU/GPU pairs and all
+  saved GPU/fresh GPU pairs agree.
+- `inconclusive`: none of those ordered relationships is established.
+
+This diagnostic does not itself accept GPU PW and does not change production
+thresholds. It records evidence for a later root-cause and acceptance decision.
