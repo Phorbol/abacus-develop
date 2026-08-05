@@ -429,13 +429,14 @@ def _source_identity(frames: list[dict]) -> dict:
 
 
 def _validate_fresh_record(
-        record: dict, config: ase_validation.Config) -> None:
+        record: dict, config: ase_validation.Config,
+        expected_identity: dict) -> None:
     run_validation.assert_json_ready(record)
     required = (
         "source", "backend", "device", "precision", "scf_converged",
         "energy_ev", "fileio_energy_ev", "energy_provenance",
         "cell_angstrom", "forces_ev_per_angstrom",
-        "ase_stress_ev_per_angstrom3")
+        "ase_stress_ev_per_angstrom3") + _SOURCE_IDENTITY_KEYS
     if not isinstance(record, dict) or any(
             key not in record for key in required):
         raise AssertionError("fresh replay record is incomplete")
@@ -445,7 +446,9 @@ def _validate_fresh_record(
             or record["precision"] != "double"
             or record["scf_converged"] is not True
             or record["energy_provenance"]
-            != "running_scf.log #TOTAL ENERGY#"):
+            != "running_scf.log #TOTAL ENERGY#"
+            or any(record[key] != expected_identity.get(key)
+                   for key in _SOURCE_IDENTITY_KEYS)):
         raise AssertionError("fresh replay record identity or convergence is invalid")
     fileio_energy = record["fileio_energy_ev"]
     if (isinstance(fileio_energy, bool)
@@ -471,6 +474,33 @@ def _reset_case_directory(
     if case.exists():
         shutil.rmtree(case)
     used.add(resolved)
+
+
+def _precompute_case_paths(
+        workdir: Path, indices: tuple[int, ...], output: Path,
+        protected_paths: tuple[Path, ...]) -> dict[tuple[int, str], Path]:
+    root = workdir.resolve()
+    if output == root or root in output.parents:
+        raise AssertionError("diagnostic output must be outside workdir")
+
+    cases: dict[tuple[int, str], Path] = {}
+    for index in indices:
+        for device in ("cpu", "gpu"):
+            case = root / "frame-{:03d}-{}".format(index, device)
+            if case.is_symlink():
+                raise AssertionError("fresh replay case path must not be a symlink")
+            resolved = case.resolve()
+            if resolved.parent != root or resolved in cases.values():
+                raise AssertionError("fresh replay case path is unsafe or reused")
+            cases[(index, device)] = resolved
+
+    for protected in protected_paths:
+        resolved_protected = protected.resolve()
+        if any(resolved_protected == case
+               or case in resolved_protected.parents
+               for case in cases.values()):
+            raise AssertionError("protected input overlaps fresh replay case")
+    return cases
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -503,7 +533,7 @@ def run_diagnostic(
         raise AssertionError("refusing to overwrite diagnostic output")
     source_hash = _sha256_file(validation_json)
     positions_hash = _sha256_file(positions)
-    pseudopotential = pp_orb_root / "Si_ONCV_PBE-1.2.upf"
+    pseudopotential = (pp_orb_root / "Si_ONCV_PBE-1.2.upf").resolve()
     pseudopotential_hash = _sha256_file(pseudopotential)
 
     source_preview = json.loads(validation_json.read_text())
@@ -515,6 +545,10 @@ def run_diagnostic(
     indices = parse_frame_indices(args.frames, frame_count)
     payload, replay_frames = load_replay_frames(
         validation_json, positions, indices)
+    case_paths = _precompute_case_paths(
+        workdir, indices, output,
+        (validation_json, positions, cpu_abacus, gpu_abacus,
+         pseudopotential))
 
     cpu_config = ase_validation.Config(
         str(cpu_abacus), "pw", "cpu", "double", workdir / "cpu",
@@ -534,17 +568,17 @@ def run_diagnostic(
     for replay_frame in replay_frames:
         index = replay_frame["index"]
         atoms = replay_frame["atoms"]
-        cpu_case = workdir / "frame-{:03d}-cpu".format(index)
-        gpu_case = workdir / "frame-{:03d}-gpu".format(index)
+        cpu_case = case_paths[(index, "cpu")]
+        gpu_case = case_paths[(index, "gpu")]
         _reset_case_directory(workdir, cpu_case, used)
         fresh_cpu = fresh_runner(cpu_config, atoms, cpu_case)
-        _validate_fresh_record(fresh_cpu, cpu_config)
+        _validate_fresh_record(fresh_cpu, cpu_config, cpu_identity)
         if not (cpu_case / "INPUT").is_file():
             raise AssertionError("fresh CPU replay INPUT is absent")
 
         _reset_case_directory(workdir, gpu_case, used)
         fresh_gpu = fresh_runner(gpu_config, atoms, gpu_case)
-        _validate_fresh_record(fresh_gpu, gpu_config)
+        _validate_fresh_record(fresh_gpu, gpu_config, gpu_identity)
         if not (gpu_case / "INPUT").is_file():
             raise AssertionError("fresh GPU replay INPUT is absent")
         assert_paired_inputs(cpu_case / "INPUT", gpu_case / "INPUT")

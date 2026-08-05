@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -564,19 +565,35 @@ class ReplayOrchestrationTests(unittest.TestCase):
             ])
         self.positions_xyz.write_text("\n".join(lines) + "\n")
 
-    def _argv(self, workdir=None, output=None):
+    def _argv(self, workdir=None, output=None, validation_json=None,
+              positions=None, cpu_abacus=None, gpu_abacus=None,
+              pp_orb_root=None):
         return [
-            "--validation-json", str(self.validation_json),
-            "--positions", str(self.positions_xyz),
-            "--cpu-abacus", str(self.cpu_abacus),
-            "--gpu-abacus", str(self.gpu_abacus),
-            "--pp-orb-root", str(self.pp_orb_root),
+            "--validation-json", str(validation_json or self.validation_json),
+            "--positions", str(positions or self.positions_xyz),
+            "--cpu-abacus", str(cpu_abacus or self.cpu_abacus),
+            "--gpu-abacus", str(gpu_abacus or self.gpu_abacus),
+            "--pp-orb-root", str(pp_orb_root or self.pp_orb_root),
             "--frames", "0,1,5,8,42,50",
             "--workdir", str(workdir or self.workdir),
             "--output", str(output or self.output),
         ]
 
-    def _fresh_runner(self, calls, invalid=None):
+    def _fresh_runner(self, calls, invalid=None, identity_paths=None):
+        paths = identity_paths or {
+            "cpu": self.cpu_abacus, "gpu": self.gpu_abacus}
+        identities = {
+            device: {
+                "executable_version": "v-test-" + device,
+                "executable_sha256": hashlib.sha256(
+                    paths[device].read_bytes()).hexdigest(),
+                "source_commit":
+                    replay.ase_validation.resolve_source_commit(),
+                "module": os.environ.get("LOADEDMODULES", ""),
+            }
+            for device in ("cpu", "gpu")
+        }
+
         def fresh_runner(config, atoms, directory):
             directory = Path(directory)
             self.assertFalse(directory.exists())
@@ -593,6 +610,7 @@ class ReplayOrchestrationTests(unittest.TestCase):
                 "positions": atoms.positions.copy(),
             })
             record = copy.deepcopy(self.steps[index])
+            record.update(identities[config.device])
             record.update({
                 "source": "fileio",
                 "device": config.device,
@@ -606,6 +624,15 @@ class ReplayOrchestrationTests(unittest.TestCase):
                 record["energy_ev"] = float("nan")
             elif invalid == "missing" and len(calls) == 4:
                 record.pop("forces_ev_per_angstrom")
+            elif (isinstance(invalid, tuple)
+                  and invalid[0] == "identity"
+                  and invalid[1] == config.device):
+                key = invalid[2]
+                replacement = record[key] + "-mismatched"
+                if key in ("executable_sha256", "source_commit"):
+                    prefix = "0" if record[key][0] != "0" else "1"
+                    replacement = prefix + record[key][1:]
+                record[key] = replacement
             return record
         return fresh_runner
 
@@ -729,6 +756,100 @@ class ReplayOrchestrationTests(unittest.TestCase):
                         fresh_runner=self._fresh_runner(calls, invalid))
                 self.assertFalse(output.exists())
                 self.assertEqual(len(calls), 4)
+
+    def test_run_diagnostic_rejects_case_input_output_before_cleanup(self):
+        workdir = self.directory / "work-output-case"
+        case = workdir / "frame-000-cpu"
+        case.mkdir(parents=True)
+        evidence = case / "raw-evidence.log"
+        evidence.write_text("preserve raw evidence\n")
+        output = case / "INPUT"
+        calls = []
+
+        with self.assertRaises(AssertionError):
+            replay.run_diagnostic(
+                replay.parse_args(self._argv(workdir, output)),
+                fresh_runner=self._fresh_runner(calls))
+        self.assertEqual(calls, [])
+        self.assertEqual(evidence.read_text(), "preserve raw evidence\n")
+        self.assertFalse(output.exists())
+
+    def test_run_diagnostic_requires_output_outside_workdir(self):
+        workdir = self.directory / "work-output-root"
+        output = workdir / "diagnostic.json"
+        calls = []
+
+        with self.assertRaises(AssertionError):
+            replay.run_diagnostic(
+                replay.parse_args(self._argv(workdir, output)),
+                fresh_runner=self._fresh_runner(calls))
+        self.assertEqual(calls, [])
+        self.assertFalse(output.exists())
+
+    def test_run_diagnostic_protects_inputs_from_case_cleanup(self):
+        original_pp = self.pp_orb_root / "Si_ONCV_PBE-1.2.upf"
+        protected_cases = (
+            ("validation_json", self.validation_json, "validation.json"),
+            ("positions", self.positions_xyz, "positions.xyz"),
+            ("cpu_abacus", self.cpu_abacus, "cpu-abacus"),
+            ("gpu_abacus", self.gpu_abacus, "gpu-abacus"),
+            ("pp_orb_root", original_pp,
+             "PP_ORB/Si_ONCV_PBE-1.2.upf"),
+        )
+        for option, source, relative in protected_cases:
+            with self.subTest(option=option):
+                workdir = self.directory / ("work-protected-" + option)
+                case = workdir / "frame-000-cpu"
+                case.mkdir(parents=True)
+                protected = case / relative
+                protected.parent.mkdir(parents=True, exist_ok=True)
+                expected = source.read_bytes()
+                protected.write_bytes(expected)
+                if option in ("cpu_abacus", "gpu_abacus"):
+                    protected.chmod(0o755)
+
+                overrides = {
+                    option: (protected.parent
+                             if option == "pp_orb_root" else protected)}
+                identity_paths = {
+                    "cpu": self.cpu_abacus, "gpu": self.gpu_abacus}
+                if option == "cpu_abacus":
+                    identity_paths["cpu"] = protected
+                elif option == "gpu_abacus":
+                    identity_paths["gpu"] = protected
+                output = self.directory / (
+                    "output-protected-{}.json".format(option))
+                calls = []
+                runner = self._fresh_runner(
+                    calls, identity_paths=identity_paths)
+
+                with self.assertRaises(AssertionError):
+                    replay.run_diagnostic(
+                        replay.parse_args(self._argv(
+                            workdir, output, **overrides)),
+                        fresh_runner=runner)
+                self.assertEqual(calls, [])
+                self.assertTrue(protected.is_file())
+                self.assertEqual(protected.read_bytes(), expected)
+
+    def test_run_diagnostic_rejects_each_fresh_identity_mismatch(self):
+        identity_keys = (
+            "executable_version", "executable_sha256",
+            "source_commit", "module")
+        for device in ("cpu", "gpu"):
+            for key in identity_keys:
+                with self.subTest(device=device, key=key):
+                    workdir = self.directory / (
+                        "work-identity-{}-{}".format(device, key))
+                    output = self.directory / (
+                        "output-identity-{}-{}.json".format(device, key))
+                    calls = []
+                    with self.assertRaises(AssertionError):
+                        replay.run_diagnostic(
+                            replay.parse_args(self._argv(workdir, output)),
+                            fresh_runner=self._fresh_runner(
+                                calls, ("identity", device, key)))
+                    self.assertFalse(output.exists())
 
 if __name__ == "__main__":
     unittest.main()
