@@ -1254,6 +1254,23 @@ TEST(SocketDriverTest, UnknownHeaderIsFatal)
     EXPECT_THAT(result.diagnostic, testing::HasSubstr("unknown i-PI header"));
 }
 
+TEST(SocketDriverTest, ExitHeaderEndsDriverSuccessfully)
+{
+    const DriverResult result = run_driver(
+        DriverConfig(),
+        [&](const int fd, const MonotonicDeadline& deadline) {
+            send_header(fd, "EXIT", deadline);
+        },
+        ChildMode::run_driver,
+        DRIVER_DEADLINE_MS,
+        nullptr);
+
+    EXPECT_EQ(0, result.exit_code);
+    EXPECT_THAT(result.diagnostic,
+                testing::Not(testing::HasSubstr("unknown i-PI header")));
+    EXPECT_EQ(0, result.observation.runner_calls);
+}
+
 TEST(SocketDriverTest, AtomCountMismatchIsFatalBeforeRunner)
 {
     WireFrame frame = fixed_frame();

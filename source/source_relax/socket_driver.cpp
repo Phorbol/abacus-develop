@@ -974,6 +974,14 @@ void Socket_Driver::socket_driver(ModuleESolver::ESolver* p_esolver,
                 published = ComputedFrame();
                 state = DriverState::Ready;
             }
+            else if (header == "EXIT")
+            {
+                if (is_root())
+                {
+                    ofs_running << " ABACUS socket driver received i-PI EXIT" << std::endl;
+                }
+                break;
+            }
             else
             {
                 if (is_root())
