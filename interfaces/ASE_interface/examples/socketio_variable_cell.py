@@ -669,14 +669,21 @@ def infer_mpi_ranks(command: str) -> int:
     launchers intentionally report one rather than guessing from environment.
     """
     tokens = shlex.split(command)
-    for index, token in enumerate(tokens[:-1]):
+    for index, token in enumerate(tokens):
+        value = None
         if token in ("-np", "-n", "--np", "--ntasks"):
-            try:
-                ranks = int(tokens[index + 1])
-            except (TypeError, ValueError):
-                break
-            if ranks > 0:
-                return ranks
+            if index + 1 < len(tokens):
+                value = tokens[index + 1]
+        elif token.startswith(("-np=", "-n=", "--np=", "--ntasks=")):
+            value = token.split("=", 1)[1]
+        if value is None:
+            continue
+        try:
+            ranks = int(value)
+        except (TypeError, ValueError):
+            break
+        if ranks > 0:
+            return ranks
     return 1
 
 
@@ -685,7 +692,7 @@ def effective_ks_solver(directory: Path, requested: str | None = None) -> str:
     candidates = sorted(directory.glob("OUT.*/INPUT.info"))
     for path in reversed(candidates):
         text = path.read_text(errors="replace")
-        match = re.search(r"^\s*ks_solver\s+(\S+)\s*$", text,
+        match = re.search(r"^\s*ks_solver\s+(\S+)(?:\s+#.*)?$", text,
                           flags=re.MULTILINE | re.IGNORECASE)
         if match:
             return match.group(1).lower()
@@ -1269,7 +1276,14 @@ def _analytic_self_test() -> None:
     assert infer_mpi_ranks("mpirun -np 2 abacus") == 2
     assert infer_mpi_ranks("srun --ntasks 4 abacus") == 4
     assert infer_mpi_ranks("abacus") == 1
+    assert infer_mpi_ranks("mpirun -np=2 abacus") == 2
+    assert infer_mpi_ranks("srun --ntasks=2 abacus") == 2
     assert effective_ks_solver(Path("absent"), "genelpa") == "genelpa"
+    with tempfile.TemporaryDirectory(prefix="solver-info-selftest-") as temporary:
+        info_dir = Path(temporary) / "OUT.ABACUS"
+        info_dir.mkdir()
+        (info_dir / "INPUT.info").write_text("ks_solver genelpa # solver comment\n")
+        assert effective_ks_solver(Path(temporary)) == "genelpa"
 
     solver_cases = (
         ("lcao-cpu-double", "lcao", "cpu", "double", 1.0e-9,
