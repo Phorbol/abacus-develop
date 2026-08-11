@@ -66,6 +66,8 @@ class ReplayFrameTests(unittest.TestCase):
             "executable_sha256": "c" * 64,
             "source_commit": "d" * 40,
             "module": "source/module",
+            "binary_commit": "e" * 9,
+            "binary_commit_source": "--info",
             "source": "official-ipi",
             "backend": "pw",
             "device": "gpu",
@@ -579,6 +581,8 @@ class ReplayExecutionTests(unittest.TestCase):
             "executable_sha256": "a" * 64,
             "source_commit": "b" * 40,
             "module": "test/module",
+            "binary_commit": "c" * 9,
+            "binary_commit_source": "--info",
         }
         with mock.patch.object(
                 replay.ase_validation, "_load_abacus_api",
@@ -707,6 +711,8 @@ class ReplayOrchestrationTests(unittest.TestCase):
             "executable_sha256": "c" * 64,
             "source_commit": "d" * 40,
             "module": "source/module",
+            "binary_commit": "unreported",
+            "binary_commit_source": "unreported",
         }
 
     def _write_xyz(self):
@@ -749,6 +755,8 @@ class ReplayOrchestrationTests(unittest.TestCase):
                 "source_commit":
                     replay.ase_validation.resolve_source_commit(),
                 "module": os.environ.get("LOADEDMODULES", ""),
+                "binary_commit": "unreported",
+                "binary_commit_source": "unreported",
             }
             for device in ("cpu", "gpu")
         }
@@ -788,7 +796,7 @@ class ReplayOrchestrationTests(unittest.TestCase):
                   and invalid[1] == config.device):
                 key = invalid[2]
                 replacement = record[key] + "-mismatched"
-                if key in ("executable_sha256", "source_commit"):
+                if key in ("executable_sha256", "source_commit", "binary_commit"):
                     prefix = "0" if record[key][0] != "0" else "1"
                     replacement = prefix + record[key][1:]
                 record[key] = replacement
@@ -1008,7 +1016,8 @@ class ReplayOrchestrationTests(unittest.TestCase):
     def test_run_diagnostic_rejects_each_fresh_identity_mismatch(self):
         identity_keys = (
             "executable_version", "executable_sha256",
-            "source_commit", "module")
+            "source_commit", "module", "binary_commit",
+            "binary_commit_source")
         for device in ("cpu", "gpu"):
             for key in identity_keys:
                 with self.subTest(device=device, key=key):

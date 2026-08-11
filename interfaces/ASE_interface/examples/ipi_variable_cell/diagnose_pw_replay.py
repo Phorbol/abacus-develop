@@ -37,6 +37,7 @@ IPI_CELL_MARKER = "CELL(abcABC):"
 IPI_CELL_PARAMETER_TOLERANCE = 5.1e-6
 _SOURCE_FRAME_IDENTITY_KEYS = (
     "executable_version", "executable_sha256", "source_commit", "module",
+    "binary_commit", "binary_commit_source",
     "source", "backend", "device", "precision")
 
 
@@ -145,7 +146,9 @@ def _validate_stored_frame(
     if stored_step["atom_count"] != len(xyz_atoms):
         raise AssertionError("stored atom count disagrees with XYZ")
     identity = {
-        key: stored_step.get(key) for key in _SOURCE_FRAME_IDENTITY_KEYS}
+        key: stored_step.get(key, "unreported")
+        if key in ("binary_commit", "binary_commit_source")
+        else stored_step.get(key) for key in _SOURCE_FRAME_IDENTITY_KEYS}
     if expected_identity is not None and identity != expected_identity:
         raise AssertionError("stored replay frame identities are inconsistent")
     try:
@@ -466,7 +469,8 @@ def run_fresh_frame(config: ase_validation.Config, atoms,
 
 
 _SOURCE_IDENTITY_KEYS = (
-    "executable_version", "executable_sha256", "source_commit", "module")
+    "executable_version", "executable_sha256", "source_commit", "module",
+    "binary_commit", "binary_commit_source")
 
 
 def _sha256_file(path: Path) -> str:
@@ -509,7 +513,9 @@ def _source_identity(frames: list[dict]) -> dict:
     if not frames:
         raise AssertionError("source replay frames are absent")
     identity = {
-        key: frames[0]["stored_gpu"].get(key)
+        key: frames[0]["stored_gpu"].get(key, "unreported")
+        if key in ("binary_commit", "binary_commit_source")
+        else frames[0]["stored_gpu"].get(key)
         for key in _SOURCE_IDENTITY_KEYS
     }
     if (not all(isinstance(identity[key], str)
@@ -521,7 +527,9 @@ def _source_identity(frames: list[dict]) -> dict:
                             identity["source_commit"]) is None):
         raise AssertionError("source validation identity is incomplete")
     for frame in frames[1:]:
-        if any(frame["stored_gpu"].get(key) != identity[key]
+        if any(frame["stored_gpu"].get(
+                key, "unreported" if key in
+                ("binary_commit", "binary_commit_source") else None) != identity[key]
                for key in _SOURCE_IDENTITY_KEYS):
             raise AssertionError("source frame identities are inconsistent")
     identity["executable_sha256"] = identity["executable_sha256"].lower()
