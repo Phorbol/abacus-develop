@@ -66,6 +66,9 @@ class Config:
     workdir: Path
     output: Path
     pp_orb_root: Path
+    # Optional explicit Kohn-Sham solver. None preserves the historical
+    # validation defaults while allowing the MPI matrix to exercise each one.
+    ks_solver: str | None = None
 
 
 def displaced_triclinic_si2():
@@ -450,10 +453,14 @@ def _common_kwargs(config: Config) -> dict:
     }
     if config.basis == "lcao":
         inp["gint_precision"] = "double" if config.precision == "double" else "mix"
-        if config.device == "cpu":
+        if config.ks_solver is not None:
+            inp["ks_solver"] = config.ks_solver
+        elif config.device == "cpu":
             # The parallel-capable validation path avoids the CUDA-aware ELPA
             # host-array defect by using ABACUS's ScaLAPACK solver.
             inp["ks_solver"] = "scalapack_gvx"
+    elif config.ks_solver is not None:
+        inp["ks_solver"] = config.ks_solver
     kwargs = {
         "pseudopotentials": {"Si": "Si_ONCV_PBE-1.2.upf"},
         "inp": inp,
@@ -643,14 +650,48 @@ def prepare_case(config: Config, directory: Path, socket: bool = True) -> Path:
     solvers = [value.lower() for value in re.findall(
         r"^\s*ks_solver\s+(\S+)\s*$", text,
         flags=re.MULTILINE | re.IGNORECASE)]
-    if config.basis == "lcao" and config.device == "cpu":
-        if solvers != ["scalapack_gvx"]:
+    expected_solver = config.ks_solver
+    if expected_solver is None and config.basis == "lcao" and config.device == "cpu":
+        expected_solver = "scalapack_gvx"
+    if expected_solver is not None:
+        if solvers != [expected_solver.lower()]:
             raise AssertionError(
-                "CPU LCAO validation requires exact ks_solver scalapack_gvx")
+                "validation requires exact ks_solver {}".format(expected_solver))
     elif solvers:
-        raise AssertionError("ks_solver is reserved for CPU LCAO validation")
+        raise AssertionError("ks_solver is not expected for this validation case")
     return directory
 
+
+def infer_mpi_ranks(command: str) -> int:
+    """Return rank count from a conventional mpirun/srun command.
+
+    This is provenance only; the launcher remains user-controlled. Unknown
+    launchers intentionally report one rather than guessing from environment.
+    """
+    tokens = shlex.split(command)
+    for index, token in enumerate(tokens[:-1]):
+        if token in ("-np", "-n", "--np", "--ntasks"):
+            try:
+                ranks = int(tokens[index + 1])
+            except (TypeError, ValueError):
+                break
+            if ranks > 0:
+                return ranks
+    return 1
+
+
+def effective_ks_solver(directory: Path, requested: str | None = None) -> str:
+    """Read the solver ABACUS resolved in INPUT.info when available."""
+    candidates = sorted(directory.glob("OUT.*/INPUT.info"))
+    for path in reversed(candidates):
+        text = path.read_text(errors="replace")
+        match = re.search(r"^\s*ks_solver\s+(\S+)\s*$", text,
+                          flags=re.MULTILINE | re.IGNORECASE)
+        if match:
+            return match.group(1).lower()
+    if requested is not None:
+        return requested.lower()
+    return "abacus-default"
 
 def _find_log(directory: Path) -> Path:
     matches = sorted(directory.glob("OUT.*/running_scf.log"))
@@ -1225,6 +1266,11 @@ def _analytic_self_test() -> None:
         raise AssertionError("stable filter fixture physical invariants changed")
 
     solver_probe_root = Path("unused")
+    assert infer_mpi_ranks("mpirun -np 2 abacus") == 2
+    assert infer_mpi_ranks("srun --ntasks 4 abacus") == 4
+    assert infer_mpi_ranks("abacus") == 1
+    assert effective_ks_solver(Path("absent"), "genelpa") == "genelpa"
+
     solver_cases = (
         ("lcao-cpu-double", "lcao", "cpu", "double", 1.0e-9,
          "double", "scalapack_gvx"),
@@ -1244,7 +1290,7 @@ def _analytic_self_test() -> None:
         solver_config = Config(
             abacus="unused", basis=basis, device=device, precision=precision,
             workdir=solver_probe_root, output=solver_probe_root,
-            pp_orb_root=solver_probe_root)
+            pp_orb_root=solver_probe_root, ks_solver=solver)
         actual_kwargs = _common_kwargs(solver_config)
         actual_inp = dict(actual_kwargs["inp"])
         actual_solver = actual_inp.pop("ks_solver", None)
@@ -1320,7 +1366,7 @@ def _analytic_self_test() -> None:
                     abacus="unused", basis=basis, device=device,
                     precision=precision, workdir=input_root,
                     output=input_root / "unused.json",
-                    pp_orb_root=input_root)
+                    pp_orb_root=input_root, ks_solver=solver)
                 for socket in (False, True):
                     case_label = label + ("-socket" if socket else "-fileio")
                     prepared = prepare_case(
@@ -1357,9 +1403,7 @@ def _analytic_self_test() -> None:
                             input_root / ("fallback-" + fallback_label.replace(" ", "-")),
                             socket=False)
                 except AssertionError as error:
-                    if str(error) != (
-                            "CPU LCAO validation requires exact "
-                            "ks_solver scalapack_gvx"):
+                    if str(error) != "validation requires exact ks_solver scalapack_gvx":
                         raise
                 else:
                     raise AssertionError(

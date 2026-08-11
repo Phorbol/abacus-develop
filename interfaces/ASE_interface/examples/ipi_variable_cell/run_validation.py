@@ -620,6 +620,11 @@ def run_instance(config: ase_validation.Config, mode: str, run_dir: Path,
     raw_frames = ase_validation.raw_frame_series(abacus_dir, parsed["sample_count"])
     enrich_ipi_frames(parsed, raw_frames, ase_validation._identity(config), config)
     parsed.update({
+        "mpi_command": config.abacus,
+        "mpi_ranks": ase_validation.infer_mpi_ranks(config.abacus),
+        "requested_ks_solver": config.ks_solver,
+        "effective_ks_solver": ase_validation.effective_ks_solver(
+            abacus_dir, config.ks_solver),
         "mode": mode, "target_pressure_gpa": float(pressure_gpa),
         "seed": int(seed), "requested_steps": int(steps),
         "socket_name": socket_name, "socket_path": str(socket_path),
@@ -653,6 +658,11 @@ def run_validation(config: ase_validation.Config, mode: str, steps: int) -> dict
         "schema_version": 1, "ipi_version": IPI_VERSION,
         "backend": config.basis, "device": config.device,
         "precision": config.precision,
+        "mpi_command": config.abacus,
+        "mpi_ranks": ase_validation.infer_mpi_ranks(config.abacus),
+        "requested_ks_solver": config.ks_solver,
+        "effective_ks_solver": ase_validation.effective_ks_solver(
+            config.workdir / "fileio_pressure_reference", config.ks_solver),
         "initial_cell_angstrom": reference_atoms.cell.array.tolist(),
         "initial_pressure_gpa_from_fileio": pressure_initial,
         "pressure_offset_gpa": 2.0,
@@ -1106,6 +1116,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--basis", choices=("pw", "lcao"), default="pw")
     parser.add_argument("--device", choices=("cpu", "gpu"), default="cpu")
     parser.add_argument("--precision", choices=("double", "single"), default="double")
+    parser.add_argument("--ks-solver", default=None,
+                        help="explicit ABACUS ks_solver (default preserves backend defaults)")
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument("--workdir", type=Path, default=Path("variable-cell-ipi"))
     parser.add_argument("--output", type=Path)
@@ -1127,7 +1139,8 @@ def main() -> None:
         "prepare.json" if args.prepare_only else "ipi-validation.json")
     config = ase_validation.Config(
         args.abacus, args.basis, args.device, args.precision,
-        args.workdir.resolve(), output.resolve(), args.pp_orb_root.resolve())
+        args.workdir.resolve(), output.resolve(), args.pp_orb_root.resolve(),
+        args.ks_solver)
     if not config.pp_orb_root.is_dir():
         raise SystemExit("--pp-orb-root does not exist: {}".format(
             config.pp_orb_root))
