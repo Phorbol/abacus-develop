@@ -661,7 +661,8 @@ def run_validation(config: ase_validation.Config, mode: str, steps: int) -> dict
         "mpi_command": config.abacus,
         "mpi_ranks": ase_validation.infer_mpi_ranks(config.abacus),
         "requested_ks_solver": config.ks_solver,
-        "effective_ks_solver": ase_validation.effective_ks_solver(
+        "effective_ks_solver": trajectory["effective_ks_solver"],
+        "fileio_reference_ks_solver": ase_validation.effective_ks_solver(
             config.workdir / "fileio_pressure_reference", config.ks_solver),
         "initial_cell_angstrom": reference_atoms.cell.array.tolist(),
         "initial_pressure_gpa_from_fileio": pressure_initial,
@@ -859,6 +860,11 @@ def _self_test() -> None:
             "device": dummy_config.device,
             "precision": dummy_config.precision,
             "initial_cell_angstrom": parsed["steps"][0]["cell_angstrom"],
+            "mpi_command": "mpirun -np 2 abacus",
+            "mpi_ranks": 2,
+            "requested_ks_solver": "genelpa",
+            "effective_ks_solver": "genelpa",
+            "fileio_reference_ks_solver": "scalapack_gvx",
             "initial_pressure_gpa_from_fileio": 0.0,
             "pressure_offset_gpa": 2.0,
             "pressure_offset_significance": {
