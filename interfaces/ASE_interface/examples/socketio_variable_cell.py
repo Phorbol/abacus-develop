@@ -671,10 +671,10 @@ def infer_mpi_ranks(command: str) -> int:
     tokens = shlex.split(command)
     for index, token in enumerate(tokens):
         value = None
-        if token in ("-np", "-n", "--np", "--ntasks"):
+        if token in ("-np", "-n", "--np", "--ntasks", "--ntasks-per-node"):
             if index + 1 < len(tokens):
                 value = tokens[index + 1]
-        elif token.startswith(("-np=", "-n=", "--np=", "--ntasks=")):
+        elif token.startswith(("-np=", "-n=", "--np=", "--ntasks=", "--ntasks-per-node=")):
             value = token.split("=", 1)[1]
         if value is None:
             continue
@@ -1278,6 +1278,8 @@ def _analytic_self_test() -> None:
     assert infer_mpi_ranks("abacus") == 1
     assert infer_mpi_ranks("mpirun -np=2 abacus") == 2
     assert infer_mpi_ranks("srun --ntasks=2 abacus") == 2
+    assert infer_mpi_ranks("srun --ntasks-per-node 2 abacus") == 2
+    assert infer_mpi_ranks("srun --ntasks-per-node=2 abacus") == 2
     assert effective_ks_solver(Path("absent"), "genelpa") == "genelpa"
     with tempfile.TemporaryDirectory(prefix="solver-info-selftest-") as temporary:
         info_dir = Path(temporary) / "OUT.ABACUS"
