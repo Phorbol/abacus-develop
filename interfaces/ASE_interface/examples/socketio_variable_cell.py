@@ -48,7 +48,6 @@ FILTER_LIMITS = {
 }
 REQUIRED_FRAME_FIELDS = (
     "executable_version", "executable_sha256", "source_commit", "module",
-    "binary_commit", "binary_commit_source",
     "backend", "device", "precision", "cell_angstrom",
     "precision_settings",
     "volume_angstrom3", "condition_number", "scf_converged", "energy_ev",
@@ -264,19 +263,24 @@ def assert_real_frame_schema(record: dict) -> None:
     if missing:
         raise AssertionError("real frame is missing fields: " + ",".join(missing))
     for key in ("executable_version", "executable_sha256", "source_commit",
-                "module", "binary_commit", "binary_commit_source",
+                "module",
                 "backend", "device", "precision"):
         if not isinstance(record[key], str):
             raise AssertionError(key + " must be a string")
     if not record["executable_version"]:
         raise AssertionError("identity strings must be nonempty")
-    if (not record["binary_commit"]
-            or (record["binary_commit"] != "unreported"
-                and re.fullmatch(r"[0-9a-f]{7,40}", record["binary_commit"]) is None)):
-        raise AssertionError("binary_commit must be 7-40 lowercase hex or unreported")
-    if record["binary_commit_source"] not in (
-            "--info", "welcome", "unreported", "unavailable"):
-        raise AssertionError("binary_commit_source is invalid")
+    binary_keys = ("binary_commit", "binary_commit_source")
+    binary_present = [key in record for key in binary_keys]
+    if any(binary_present):
+        if not all(binary_present):
+            raise AssertionError("binary provenance fields must be paired")
+        if (not record["binary_commit"]
+                or (record["binary_commit"] != "unreported"
+                    and re.fullmatch(r"[0-9a-f]{7,40}", record["binary_commit"]) is None)):
+            raise AssertionError("binary_commit must be 7-40 lowercase hex or unreported")
+        if record["binary_commit_source"] not in (
+                "--info", "welcome", "unreported", "unavailable"):
+            raise AssertionError("binary_commit_source is invalid")
     if re.fullmatch(r"[0-9a-f]{40}", record["source_commit"]) is None:
         raise AssertionError("source_commit must be normalized 40-hex")
     if (len(record["executable_sha256"]) != 64
@@ -927,8 +931,16 @@ def assert_prepare_manifest(manifest: dict) -> None:
                      or not Path(orbital).is_absolute()))):
         raise AssertionError("prepare orbital path is inconsistent")
     identity = manifest["identity"]
+    if not isinstance(identity, dict):
+        raise AssertionError("prepare manifest identity is incomplete")
     identity_fields = ("executable_version", "executable_sha256", "source_commit",
-                       "binary_commit", "binary_commit_source", "module")
+                       "module")
+    binary_identity_fields = ("binary_commit", "binary_commit_source")
+    present_binary_identity = [key in identity for key in binary_identity_fields]
+    if any(present_binary_identity) and not all(present_binary_identity):
+        raise AssertionError("prepare binary provenance fields must be paired")
+    if all(present_binary_identity):
+        identity_fields += binary_identity_fields
     if not isinstance(identity, dict) or not all(
             key in identity for key in identity_fields):
         raise AssertionError("prepare manifest identity is incomplete")
@@ -939,12 +951,13 @@ def assert_prepare_manifest(manifest: dict) -> None:
                             identity["executable_sha256"]) is None
             or re.fullmatch(r"[0-9a-f]{40}",
                             identity["source_commit"]) is None
-            or not identity["binary_commit"]
-            or (identity["binary_commit"] != "unreported"
-                and re.fullmatch(r"[0-9a-f]{7,40}",
-                                 identity["binary_commit"]) is None)
-            or identity["binary_commit_source"] not in (
-                "--info", "welcome", "unreported", "unavailable")):
+            or (all(present_binary_identity)
+                and (not identity["binary_commit"]
+                     or (identity["binary_commit"] != "unreported"
+                         and re.fullmatch(r"[0-9a-f]{7,40}",
+                                          identity["binary_commit"]) is None)
+                     or identity["binary_commit_source"] not in (
+                         "--info", "welcome", "unreported", "unavailable")))):
         raise AssertionError("prepare manifest identity is invalid")
 
 
