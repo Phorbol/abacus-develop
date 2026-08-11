@@ -612,7 +612,7 @@
 - **Type**: Boolean
 - **Description**: Explicitly opt in to variable-cell socket coupling. When set to True, ABACUS accepts complete 3x3 cell updates from i-PI POSDATA messages.
 
-  > Note: This mode requires socket_driver = True, calculation = scf, esolver_type = ksdft, and basis_type = pw or lcao. Force and stress calculations are enabled automatically because stress is mandatory for variable-cell coupling. The external driver or barostat owns pressure control, so press1, press2, and press3 must remain zero.
+  > Note: This mode requires socket_driver = True, calculation = scf, esolver_type = ksdft, and basis_type = pw or lcao. Force and stress calculations remain independently controlled by cal_force and cal_stress. Enable cal_stress when the external driver or barostat needs a virial; enable cal_force when it needs forces. The external driver or barostat owns pressure control, so press1, press2, and press3 must remain zero.
 - **Default**: False
 
 ### esolver_type

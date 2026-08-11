@@ -164,16 +164,9 @@ When using the ASE AbacusSocketIO interface, this environment variable is set au
         item.type = "Boolean";
         item.description = R"(Explicitly opt in to variable-cell socket coupling. When set to True, ABACUS accepts complete 3x3 cell updates from i-PI POSDATA messages.
 
-[NOTE] This mode requires socket_driver = True, calculation = scf, esolver_type = ksdft, and basis_type = pw or lcao. Force and stress calculations are enabled automatically because stress is mandatory for variable-cell coupling. The external driver or barostat owns pressure control, so press1, press2, and press3 must remain zero.)";
+[NOTE] This mode requires socket_driver = True, calculation = scf, esolver_type = ksdft, and basis_type = pw or lcao. Force and stress calculations remain independently controlled by cal_force and cal_stress. Enable cal_stress when the external driver or barostat needs a virial; enable cal_force when it needs forces. The external driver or barostat owns pressure control, so press1, press2, and press3 must remain zero.)";
         item.default_value = "False";
         read_sync_bool(input.socket_variable_cell);
-        item.reset_value = [](const Input_Item& item, Parameter& para) {
-            if (para.input.socket_variable_cell)
-            {
-                para.input.cal_force = true;
-                para.input.cal_stress = true;
-            }
-        };
         item.check_value = [](const Input_Item& item, const Parameter& para) {
             if (!para.input.socket_variable_cell)
             {
@@ -353,7 +346,7 @@ When using the ASE AbacusSocketIO interface, this environment variable is set au
         item.reset_value = [](const Input_Item& item, Parameter& para) {
             std::vector<std::string> use_force = {"cell-relax", "relax", "md"};
             std::vector<std::string> not_use_force = {"get_wf", "get_pchg", "get_s"};
-            if (para.input.socket_driver || std::find(use_force.begin(), use_force.end(), para.input.calculation) != use_force.end())
+            if (std::find(use_force.begin(), use_force.end(), para.input.calculation) != use_force.end())
             {
                 if (!para.input.cal_force)
                 {

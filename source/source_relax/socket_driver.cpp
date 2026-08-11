@@ -18,6 +18,8 @@
 #include <cstdlib>
 #include <exception>
 #include <limits>
+#include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -42,10 +44,39 @@ enum class DriverState
 struct ComputedFrame
 {
     bool valid = false;
+    bool forces_present = false;
+    bool stress_present = false;
+    bool scf_converged = true;
     double energy_hartree = 0.0;
     std::vector<double> forces_hartree_per_bohr;
     SocketFrame::Matrix9 virial_wire_hartree = {{0.0}};
 };
+
+bool all_ranks_converged(const bool local_converged)
+{
+    int converged = local_converged ? 1 : 0;
+#ifdef __MPI
+    MPI_Allreduce(MPI_IN_PLACE, &converged, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+#endif
+    return converged != 0;
+}
+
+std::string properties_extra(const ComputedFrame& frame)
+{
+    std::ostringstream extra;
+    extra << "{\"schema\":\"abacus.socket.properties.v1\",\"present\":[\"energy\"";
+    if (frame.forces_present)
+    {
+        extra << ",\"forces\"";
+    }
+    if (frame.stress_present)
+    {
+        extra << ",\"stress\"";
+    }
+    extra << "],\"scf_converged\":"
+          << (frame.scf_converged ? "true" : "false") << "}";
+    return extra.str();
+}
 
 struct PendingInputFrame
 {
@@ -463,14 +494,6 @@ void Socket_Driver::socket_driver(ModuleESolver::ESolver* p_esolver,
     {
         ModuleBase::WARNING_QUIT("ABACUS socket", "socket driver requires a valid ESolver.");
     }
-    if (!inp.cal_force)
-    {
-        ModuleBase::WARNING_QUIT("ABACUS socket", "socket_driver requires cal_force=1 for i-PI GETFORCE.");
-    }
-    if (inp.socket_variable_cell && !inp.cal_stress)
-    {
-        ModuleBase::WARNING_QUIT("ABACUS socket", "socket_variable_cell requires cal_stress=1.");
-    }
 
     IpiSocket socket;
 
@@ -826,9 +849,12 @@ void Socket_Driver::socket_driver(ModuleESolver::ESolver* p_esolver,
                                                  "unknown socket runner failure");
                 }
 
-                local_failed = p_esolver->conv_esolver ? 0 : 1;
-                local_message = local_failed != 0 ? "socket step SCF did not converge" : "";
-                throw_if_any_rank_failed(local_failed, local_message);
+                computed.scf_converged = all_ranks_converged(p_esolver->conv_esolver);
+                if (!computed.scf_converged && is_root())
+                {
+                    ModuleBase::WARNING("ABACUS socket",
+                                        "SCF did not converge; returning the available frame and marking it in i-PI extras.");
+                }
 
                 double energy_ry = 0.0;
                 local_failed = 0;
@@ -858,38 +884,42 @@ void Socket_Driver::socket_driver(ModuleESolver::ESolver* p_esolver,
                                 << computed.energy_hartree << " Ha" << std::endl;
                 }
 
-                local_failed = 0;
-                local_message.clear();
-                ModuleBase::matrix force;
-                try
+                if (inp.cal_force)
                 {
-                    p_esolver->cal_force(ucell, force);
+                    local_failed = 0;
+                    local_message.clear();
+                    ModuleBase::matrix force;
+                    try
+                    {
+                        p_esolver->cal_force(ucell, force);
+                    }
+                    catch (const std::exception& exc)
+                    {
+                        fail_during_collective_stage("cal_force", exc.what());
+                    }
+                    catch (...)
+                    {
+                        fail_during_collective_stage("cal_force",
+                                                     "unknown socket force failure");
+                    }
+                    try
+                    {
+                        computed.forces_hartree_per_bohr
+                            = flatten_forces_hartree_per_bohr(force, ucell.nat);
+                        computed.forces_present = true;
+                    }
+                    catch (const std::exception& exc)
+                    {
+                        local_failed = 1;
+                        local_message = exc.what();
+                    }
+                    catch (...)
+                    {
+                        local_failed = 1;
+                        local_message = "unknown socket force failure";
+                    }
+                    throw_if_any_rank_failed(local_failed, local_message);
                 }
-                catch (const std::exception& exc)
-                {
-                    fail_during_collective_stage("cal_force", exc.what());
-                }
-                catch (...)
-                {
-                    fail_during_collective_stage("cal_force",
-                                                 "unknown socket force failure");
-                }
-                try
-                {
-                    computed.forces_hartree_per_bohr
-                        = flatten_forces_hartree_per_bohr(force, ucell.nat);
-                }
-                catch (const std::exception& exc)
-                {
-                    local_failed = 1;
-                    local_message = exc.what();
-                }
-                catch (...)
-                {
-                    local_failed = 1;
-                    local_message = "unknown socket force failure";
-                }
-                throw_if_any_rank_failed(local_failed, local_message);
 
                 if (inp.cal_stress)
                 {
@@ -921,6 +951,7 @@ void Socket_Driver::socket_driver(ModuleESolver::ESolver* p_esolver,
                             throw std::runtime_error(virial.message);
                         }
                         computed.virial_wire_hartree = virial.wire_virial_hartree;
+                        computed.stress_present = true;
                     }
                     catch (const std::exception& exc)
                     {
@@ -957,11 +988,21 @@ void Socket_Driver::socket_driver(ModuleESolver::ESolver* p_esolver,
                             socket.write_header("FORCEREADY");
                             socket.write_double(published.energy_hartree);
                             socket.write_int32(static_cast<std::int32_t>(nat_return));
-                            socket.write_doubles(published.forces_hartree_per_bohr);
+                            const std::vector<double> forces
+                                = published.forces_present
+                                      ? published.forces_hartree_per_bohr
+                                      : std::vector<double>(static_cast<std::size_t>(3 * nat_return), 0.0);
+                            socket.write_doubles(forces);
                             const std::vector<double> virial(published.virial_wire_hartree.begin(),
                                                              published.virial_wire_hartree.end());
                             socket.write_doubles(virial);
-                            socket.write_int32(0);
+                            const std::string extra = properties_extra(published);
+                            if (extra.size() > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()))
+                            {
+                                throw std::overflow_error("i-PI extras payload is larger than int32");
+                            }
+                            socket.write_int32(static_cast<std::int32_t>(extra.size()));
+                            socket.write_string(extra);
                         }
                         catch (const std::exception& exc)
                         {

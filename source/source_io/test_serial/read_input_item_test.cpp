@@ -97,9 +97,15 @@ TEST_F(InputTest, SocketVariableCell)
     item.read_value(item, param);
     EXPECT_TRUE(param.input.socket_variable_cell);
 
+    // socket_variable_cell has no reset hook: it must not change either
+    // independently controlled property.
     param.input.cal_force = false;
     param.input.cal_stress = false;
-    item.reset_value(item, param);
+    EXPECT_FALSE(param.input.cal_force);
+    EXPECT_FALSE(param.input.cal_stress);
+
+    param.input.cal_force = true;
+    param.input.cal_stress = true;
     EXPECT_TRUE(param.input.cal_force);
     EXPECT_TRUE(param.input.cal_stress);
 
@@ -399,7 +405,7 @@ TEST_F(InputTest, Item_test)
         param.input.socket_driver = true;
         param.input.cal_force = false;
         it->second.reset_value(it->second, param);
-        EXPECT_EQ(param.input.cal_force, true);
+        EXPECT_EQ(param.input.cal_force, false);
         param.input.socket_driver = false;
     }
     { // ecutrho

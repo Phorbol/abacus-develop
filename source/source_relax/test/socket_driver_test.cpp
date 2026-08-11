@@ -591,6 +591,7 @@ struct ForceResponse
     std::vector<double> forces_hartree_per_bohr;
     std::vector<double> virial_wire_hartree;
     std::int32_t extra_bytes = -1;
+    std::string extra;
 };
 
 ForceResponse request_force(const int fd, const MonotonicDeadline& deadline)
@@ -608,6 +609,15 @@ ForceResponse request_force(const int fd, const MonotonicDeadline& deadline)
         = read_doubles(fd, static_cast<std::size_t>(3 * response.nat), deadline);
     response.virial_wire_hartree = read_doubles(fd, 9, deadline);
     response.extra_bytes = read_value<std::int32_t>(fd, deadline);
+    if (response.extra_bytes < 0)
+    {
+        throw std::runtime_error("negative i-PI extras length");
+    }
+    response.extra.resize(static_cast<std::size_t>(response.extra_bytes));
+    if (!response.extra.empty())
+    {
+        read_all(fd, &response.extra[0], response.extra.size(), deadline);
+    }
     return response;
 }
 
@@ -779,6 +789,7 @@ class FakeESolver : public ModuleESolver::ESolver
 struct DriverConfig
 {
     bool variable_cell = false;
+    bool cal_force = true;
     bool cal_stress = false;
     SolverConfig solver;
 };
@@ -886,7 +897,7 @@ DriverResult run_driver(const DriverConfig& config,
         UnitCell ucell;
         initialize_two_atom_cell(ucell);
         Input_para input;
-        input.cal_force = true;
+        input.cal_force = config.cal_force;
         input.cal_stress = config.cal_stress;
         input.socket_variable_cell = config.variable_cell;
         input.nspin = 1;
@@ -1055,7 +1066,10 @@ TEST(SocketDriverTest, VariableCellCommitReturnsMappedEnergyForceAndVirial)
     {
         EXPECT_NEAR(expected_virial[index], response.virial_wire_hartree[index], 1.0e-12);
     }
-    EXPECT_EQ(0, response.extra_bytes);
+    EXPECT_GT(response.extra_bytes, 0);
+    EXPECT_THAT(response.extra, testing::HasSubstr("\"forces\""));
+    EXPECT_THAT(response.extra, testing::HasSubstr("\"stress\""));
+    EXPECT_THAT(response.extra, testing::HasSubstr("\"scf_converged\":true"));
 
     const double expected_latvec[9] = {1.0, 0.05, 0.1,
                                        0.15, 1.5, 0.2,
@@ -1104,6 +1118,64 @@ TEST(SocketDriverTest, FixedModeReturnsProtocolZeroVirialWhenStressIsDisabled)
                                      0.0, 0.0, 0.0));
     EXPECT_EQ(0, result.observation.stress_calls);
     EXPECT_EQ(0, result.observation.cell_parameter_updated);
+}
+
+TEST(SocketDriverTest, EnergyOnlyFramePublishesPresenceWithoutForceOrStress)
+{
+    DriverConfig config;
+    config.cal_force = false;
+    ForceResponse response;
+    const DriverResult result = run_driver(
+        config,
+        [&](const int fd, const MonotonicDeadline& deadline) {
+            send_init(fd, deadline);
+            send_posdata(fd, fixed_frame(), deadline);
+            response = request_force(fd, deadline);
+        },
+        ChildMode::run_driver,
+        DRIVER_DEADLINE_MS,
+        nullptr);
+
+    EXPECT_EQ(0, result.exit_code);
+    EXPECT_EQ("FORCEREADY", response.header);
+    EXPECT_THAT(response.forces_hartree_per_bohr,
+                testing::ElementsAre(0.0, 0.0, 0.0, 0.0, 0.0, 0.0));
+    EXPECT_THAT(response.virial_wire_hartree,
+                testing::ElementsAre(0.0, 0.0, 0.0,
+                                     0.0, 0.0, 0.0,
+                                     0.0, 0.0, 0.0));
+    EXPECT_THAT(response.extra, testing::HasSubstr("\"present\":[\"energy\"]"));
+    EXPECT_THAT(response.extra, testing::Not(testing::HasSubstr("\"forces\"")));
+    EXPECT_THAT(response.extra, testing::Not(testing::HasSubstr("\"stress\"")));
+    EXPECT_EQ(0, result.observation.force_calls);
+    EXPECT_EQ(0, result.observation.stress_calls);
+}
+
+TEST(SocketDriverTest, EnergyAndStressFrameDoesNotComputeForce)
+{
+    DriverConfig config;
+    config.cal_force = false;
+    config.cal_stress = true;
+    ForceResponse response;
+    const DriverResult result = run_driver(
+        config,
+        [&](const int fd, const MonotonicDeadline& deadline) {
+            send_init(fd, deadline);
+            send_posdata(fd, fixed_frame(), deadline);
+            response = request_force(fd, deadline);
+        },
+        ChildMode::run_driver,
+        DRIVER_DEADLINE_MS,
+        nullptr);
+
+    EXPECT_EQ(0, result.exit_code);
+    EXPECT_EQ("FORCEREADY", response.header);
+    EXPECT_THAT(response.extra,
+                testing::HasSubstr("\"present\":[\"energy\",\"stress\"]"));
+    EXPECT_THAT(response.extra, testing::Not(testing::HasSubstr("\"forces\"")));
+    EXPECT_EQ(0, result.observation.force_calls);
+    EXPECT_EQ(1, result.observation.stress_calls);
+    EXPECT_NE(0.0, response.virial_wire_hartree[0]);
 }
 
 TEST(SocketDriverTest, ScaleAwareUnchangedCellDoesNotRequestCellRebuild)
@@ -1191,7 +1263,6 @@ TEST(SocketDriverTest, PosdataBeforeInitIsFatal)
         DriverConfig(),
         [&](const int fd, const MonotonicDeadline& deadline) {
             send_posdata(fd, fixed_frame(), deadline);
-            static_cast<void>(request_status(fd, deadline));
         },
         ChildMode::run_driver,
         DRIVER_DEADLINE_MS,
@@ -1300,7 +1371,6 @@ TEST(SocketDriverTest, InvalidReceivedInverseIsFatalBeforeRunner)
         [&](const int fd, const MonotonicDeadline& deadline) {
             send_init(fd, deadline);
             send_posdata(fd, frame, deadline);
-            static_cast<void>(request_status(fd, deadline));
         },
         ChildMode::run_driver,
         DRIVER_DEADLINE_MS,
@@ -1353,7 +1423,6 @@ TEST(SocketDriverTest, MidFrameDisconnectIsFatal)
 TEST(SocketDriverTest, FailedSecondFrameCannotRepublishFirstResult)
 {
     ForceResponse first_response;
-    std::string second_status;
     WireFrame invalid = fixed_frame();
     invalid.inverse.fill(0.0);
     const DriverResult result = run_driver(
@@ -1363,14 +1432,12 @@ TEST(SocketDriverTest, FailedSecondFrameCannotRepublishFirstResult)
             send_posdata(fd, fixed_frame(), deadline);
             first_response = request_force(fd, deadline);
             send_posdata(fd, invalid, deadline);
-            second_status = request_status(fd, deadline);
         },
         ChildMode::run_driver,
         DRIVER_DEADLINE_MS,
         nullptr);
 
     EXPECT_EQ("FORCEREADY", first_response.header);
-    EXPECT_TRUE(second_status.empty());
     EXPECT_EQ(1, result.exit_code);
     EXPECT_EQ(1, result.observation.runner_calls);
 }
@@ -1403,7 +1470,6 @@ TEST(SocketDriverTest, RunnerFailureAfterCellCommitIsFatalWithoutRollback)
         [&](const int fd, const MonotonicDeadline& deadline) {
             send_init(fd, deadline);
             send_posdata(fd, triclinic_frame(), deadline);
-            static_cast<void>(request_status(fd, deadline));
         },
         ChildMode::run_driver,
         DRIVER_DEADLINE_MS,
@@ -1418,45 +1484,45 @@ TEST(SocketDriverTest, RunnerFailureAfterCellCommitIsFatalWithoutRollback)
     EXPECT_EQ(1, result.observation.cell_parameter_updated);
 }
 
-TEST(SocketDriverTest, NonconvergedFrameIsNotPublished)
+TEST(SocketDriverTest, NonconvergedFrameIsPublishedWithStatus)
 {
     DriverConfig config;
     config.solver.converged = false;
+    ForceResponse response;
     std::string status;
     const DriverResult result = run_driver(
         config,
         [&](const int fd, const MonotonicDeadline& deadline) {
             send_init(fd, deadline);
             send_posdata(fd, fixed_frame(), deadline);
+            response = request_force(fd, deadline);
             status = request_status(fd, deadline);
         },
         ChildMode::run_driver,
         DRIVER_DEADLINE_MS,
         nullptr);
 
-    EXPECT_TRUE(status.empty());
-    EXPECT_EQ(1, result.exit_code);
-    EXPECT_THAT(result.diagnostic, testing::HasSubstr("SCF did not converge"));
-    EXPECT_EQ(0, result.observation.force_calls);
+    EXPECT_EQ("FORCEREADY", response.header);
+    EXPECT_EQ("READY", status);
+    EXPECT_EQ(0, result.exit_code);
+    EXPECT_THAT(response.extra, testing::HasSubstr("\"scf_converged\":false"));
+    EXPECT_EQ(1, result.observation.force_calls);
 }
 
 TEST(SocketDriverTest, NonfiniteEnergyIsNotPublished)
 {
     DriverConfig config;
     config.solver.nonfinite_energy = true;
-    std::string status;
     const DriverResult result = run_driver(
         config,
         [&](const int fd, const MonotonicDeadline& deadline) {
             send_init(fd, deadline);
             send_posdata(fd, fixed_frame(), deadline);
-            status = request_status(fd, deadline);
         },
         ChildMode::run_driver,
         DRIVER_DEADLINE_MS,
         nullptr);
 
-    EXPECT_TRUE(status.empty());
     EXPECT_EQ(1, result.exit_code);
     EXPECT_THAT(result.diagnostic, testing::HasSubstr("energy must be finite"));
 }
@@ -1465,19 +1531,16 @@ TEST(SocketDriverTest, NonfiniteForceIsNotPublished)
 {
     DriverConfig config;
     config.solver.nonfinite_force = true;
-    std::string status;
     const DriverResult result = run_driver(
         config,
         [&](const int fd, const MonotonicDeadline& deadline) {
             send_init(fd, deadline);
             send_posdata(fd, fixed_frame(), deadline);
-            status = request_status(fd, deadline);
         },
         ChildMode::run_driver,
         DRIVER_DEADLINE_MS,
         nullptr);
 
-    EXPECT_TRUE(status.empty());
     EXPECT_EQ(1, result.exit_code);
     EXPECT_THAT(result.diagnostic, testing::HasSubstr("force entries must be finite"));
 }
@@ -1487,19 +1550,16 @@ TEST(SocketDriverTest, NonfiniteStressIsNotPublished)
     DriverConfig config;
     config.cal_stress = true;
     config.solver.nonfinite_stress = true;
-    std::string status;
     const DriverResult result = run_driver(
         config,
         [&](const int fd, const MonotonicDeadline& deadline) {
             send_init(fd, deadline);
             send_posdata(fd, fixed_frame(), deadline);
-            status = request_status(fd, deadline);
         },
         ChildMode::run_driver,
         DRIVER_DEADLINE_MS,
         nullptr);
 
-    EXPECT_TRUE(status.empty());
     EXPECT_EQ(1, result.exit_code);
     EXPECT_THAT(result.diagnostic, testing::HasSubstr("stress entries must be finite"));
 }
