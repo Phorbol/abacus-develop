@@ -48,6 +48,7 @@ FILTER_LIMITS = {
 }
 REQUIRED_FRAME_FIELDS = (
     "executable_version", "executable_sha256", "source_commit", "module",
+    "binary_commit", "binary_commit_source",
     "backend", "device", "precision", "cell_angstrom",
     "precision_settings",
     "volume_angstrom3", "condition_number", "scf_converged", "energy_ev",
@@ -263,11 +264,19 @@ def assert_real_frame_schema(record: dict) -> None:
     if missing:
         raise AssertionError("real frame is missing fields: " + ",".join(missing))
     for key in ("executable_version", "executable_sha256", "source_commit",
-                "module", "backend", "device", "precision"):
+                "module", "binary_commit", "binary_commit_source",
+                "backend", "device", "precision"):
         if not isinstance(record[key], str):
             raise AssertionError(key + " must be a string")
     if not record["executable_version"]:
         raise AssertionError("identity strings must be nonempty")
+    if (not record["binary_commit"]
+            or (record["binary_commit"] != "unreported"
+                and re.fullmatch(r"[0-9a-f]{7,40}", record["binary_commit"]) is None)):
+        raise AssertionError("binary_commit must be 7-40 lowercase hex or unreported")
+    if record["binary_commit_source"] not in (
+            "--info", "welcome", "unreported", "unavailable"):
+        raise AssertionError("binary_commit_source is invalid")
     if re.fullmatch(r"[0-9a-f]{40}", record["source_commit"]) is None:
         raise AssertionError("source_commit must be normalized 40-hex")
     if (len(record["executable_sha256"]) != 64
@@ -809,6 +818,18 @@ def resolve_source_commit(script_path: Path | None = None) -> str:
     return _normalize_source_commit(value, str(marker))
 
 
+def parse_binary_commit(text: str) -> tuple[str, str]:
+    """Extract a build commit from ABACUS --info or its welcome banner."""
+    patterns = (
+        ("--info", r"^\s*Git Commit:\s*([0-9a-fA-F]{7,40})\b"),
+        ("welcome", r"^\s*Commit:\s*([0-9a-fA-F]{7,40})\b"),
+    )
+    for source, pattern in patterns:
+        match = re.search(pattern, text, flags=re.MULTILINE)
+        if match is not None:
+            return match.group(1).lower(), source
+    return "unreported", "unreported"
+
 def _identity(config: Config) -> dict:
     command = shlex.split(config.abacus)
     completed = subprocess.run(command + ["--version"], text=True,
@@ -827,8 +848,17 @@ def _identity(config: Config) -> dict:
         raise AssertionError("cannot resolve ABACUS executable for hashing")
     digest = hashlib.sha256(binary.read_bytes()).hexdigest()
     source_commit = resolve_source_commit()
+    try:
+        info = subprocess.run([str(binary), "--info"], text=True,
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              timeout=30, check=False)
+        binary_commit, binary_commit_source = parse_binary_commit(info.stdout)
+    except (OSError, subprocess.TimeoutExpired):
+        binary_commit, binary_commit_source = "unreported", "unavailable"
     return {"executable_version": match.group(1),
             "executable_sha256": digest, "source_commit": source_commit,
+            "binary_commit": binary_commit,
+            "binary_commit_source": binary_commit_source,
             "module": os.environ.get("LOADEDMODULES", "")}
 
 
@@ -897,17 +927,24 @@ def assert_prepare_manifest(manifest: dict) -> None:
                      or not Path(orbital).is_absolute()))):
         raise AssertionError("prepare orbital path is inconsistent")
     identity = manifest["identity"]
+    identity_fields = ("executable_version", "executable_sha256", "source_commit",
+                       "binary_commit", "binary_commit_source", "module")
     if not isinstance(identity, dict) or not all(
-            key in identity for key in ("executable_version", "executable_sha256",
-                                        "source_commit", "module")):
+            key in identity for key in identity_fields):
         raise AssertionError("prepare manifest identity is incomplete")
     if (not all(isinstance(identity[key], str) for key in
-                ("executable_version", "executable_sha256", "source_commit", "module"))
+                identity_fields)
             or not identity["executable_version"]
             or re.fullmatch(r"[0-9a-fA-F]{64}",
                             identity["executable_sha256"]) is None
             or re.fullmatch(r"[0-9a-f]{40}",
-                            identity["source_commit"]) is None):
+                            identity["source_commit"]) is None
+            or not identity["binary_commit"]
+            or (identity["binary_commit"] != "unreported"
+                and re.fullmatch(r"[0-9a-f]{7,40}",
+                                 identity["binary_commit"]) is None)
+            or identity["binary_commit_source"] not in (
+                "--info", "welcome", "unreported", "unavailable")):
         raise AssertionError("prepare manifest identity is invalid")
 
 
@@ -1273,6 +1310,9 @@ def _analytic_self_test() -> None:
         raise AssertionError("stable filter fixture physical invariants changed")
 
     solver_probe_root = Path("unused")
+    assert parse_binary_commit("Git Commit: 4B4977CF5 (build)\n") == (
+        "4b4977cf5", "--info")
+    assert parse_binary_commit("Commit: 69c5664c3\n") == ("69c5664c3", "welcome")
     assert infer_mpi_ranks("mpirun -np 2 abacus") == 2
     assert infer_mpi_ranks("srun --ntasks 4 abacus") == 4
     assert infer_mpi_ranks("abacus") == 1
@@ -1545,6 +1585,7 @@ def _analytic_self_test() -> None:
     frame = {
         "executable_version": "self-test", "executable_sha256": "0" * 64,
         "source_commit": "a" * 40, "module": "self-test",
+        "binary_commit": "4b4977cf5", "binary_commit_source": "--info",
         "backend": "pw", "device": "cpu", "precision": "double",
         "precision_settings": {"precision": "double", "gint_precision": None,
                                "socket_float": "IEEE-754 binary64"},
@@ -1579,6 +1620,8 @@ def _analytic_self_test() -> None:
         "garbage-force": {"forces_ev_per_angstrom": [["garbage", 0, 0], [0, 0, 0]]},
         "one-by-one-raw-stress": {"raw_abacus_stress_kbar": [[0.0]]},
         "garbage-sha256": {"executable_sha256": "not-a-sha256"},
+        "garbage-binary-commit": {"binary_commit": "not-a-commit"},
+        "invalid-binary-source": {"binary_commit_source": "guess"},
         "invalid-source-commit": {"source_commit": "unknown"},
         "unnormalized-source-commit": {"source_commit": "A" * 40},
         "volume-cell-mismatch": {"volume_angstrom3": 2.0},
@@ -1608,7 +1651,8 @@ def _analytic_self_test() -> None:
         "socket_variable_cell": True, "cal_stress": True,
         "identity": {"executable_version": "self-test",
                      "executable_sha256": "0" * 64,
-                     "source_commit": "a" * 40, "module": "self-test"},
+                     "source_commit": "a" * 40, "binary_commit": "4b4977cf5",
+                     "binary_commit_source": "--info", "module": "self-test"},
     }
     assert_prepare_manifest(manifest)
     incomplete_manifest = dict(manifest)
@@ -1623,6 +1667,12 @@ def _analytic_self_test() -> None:
             ("invalid-identity-sha",
              lambda value: value["identity"].update(
                  {"executable_sha256": "invalid"})),
+            ("invalid-binary-commit",
+             lambda value: value["identity"].update(
+                 {"binary_commit": "not-a-commit"})),
+            ("invalid-binary-source",
+             lambda value: value["identity"].update(
+                 {"binary_commit_source": "guess"})),
             ("invalid-source-commit",
              lambda value: value["identity"].update(
                  {"source_commit": "unknown"})),

@@ -618,10 +618,13 @@ def run_instance(config: ase_validation.Config, mode: str, run_dir: Path,
     stability = evaluate_ipi_stability(
         parsed, mode, run_dir / (prefix + ".checkpoint"))
     raw_frames = ase_validation.raw_frame_series(abacus_dir, parsed["sample_count"])
-    enrich_ipi_frames(parsed, raw_frames, ase_validation._identity(config), config)
+    identity = ase_validation._identity(config)
+    enrich_ipi_frames(parsed, raw_frames, identity, config)
     parsed.update({
         "mpi_command": config.abacus,
         "mpi_ranks": ase_validation.infer_mpi_ranks(config.abacus),
+        "binary_commit": identity["binary_commit"],
+        "binary_commit_source": identity["binary_commit_source"],
         "requested_ks_solver": config.ks_solver,
         "effective_ks_solver": ase_validation.effective_ks_solver(
             abacus_dir, config.ks_solver),
@@ -660,6 +663,10 @@ def run_validation(config: ase_validation.Config, mode: str, steps: int) -> dict
         "precision": config.precision,
         "mpi_command": config.abacus,
         "mpi_ranks": ase_validation.infer_mpi_ranks(config.abacus),
+        "binary_commit": trajectory["binary_commit"],
+        "binary_commit_source": trajectory["binary_commit_source"],
+        "fileio_reference_binary_commit": reference["binary_commit"],
+        "fileio_reference_binary_commit_source": reference["binary_commit_source"],
         "requested_ks_solver": config.ks_solver,
         "effective_ks_solver": trajectory["effective_ks_solver"],
         "fileio_reference_ks_solver": ase_validation.effective_ks_solver(
@@ -842,6 +849,7 @@ def _self_test() -> None:
             "executable_version": "self-test",
             "executable_sha256": "0" * 64,
             "source_commit": "a" * 40, "module": "self-test",
+            "binary_commit": "4b4977cf5", "binary_commit_source": "--info",
         }
         from ase import units
         raw_frames = []
@@ -862,6 +870,10 @@ def _self_test() -> None:
             "initial_cell_angstrom": parsed["steps"][0]["cell_angstrom"],
             "mpi_command": "mpirun -np 2 abacus",
             "mpi_ranks": 2,
+            "binary_commit": identity["binary_commit"],
+            "binary_commit_source": identity["binary_commit_source"],
+            "fileio_reference_binary_commit": identity["binary_commit"],
+            "fileio_reference_binary_commit_source": identity["binary_commit_source"],
             "requested_ks_solver": "genelpa",
             "effective_ks_solver": "genelpa",
             "fileio_reference_ks_solver": "scalapack_gvx",
@@ -1011,7 +1023,8 @@ def _self_test() -> None:
             "socket_variable_cell": True, "cal_stress": True,
             "identity": {"executable_version": "self-test",
                          "executable_sha256": "0" * 64,
-                         "source_commit": "a" * 40, "module": "self-test"},
+                         "source_commit": "a" * 40, "binary_commit": "4b4977cf5",
+                         "binary_commit_source": "--info", "module": "self-test"},
             "official_ipi": {
                 "version": IPI_VERSION,
                 "parser": "Simulation.load_from_xml(read_only=True)",
